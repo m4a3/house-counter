@@ -1,0 +1,30 @@
+name: Enforce Rebasing
+
+on:
+  push:
+    branches:
+      - 'dev'
+      - 'main'
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - 'dev'
+      - 'main'
+
+jobs:
+  rebase_job:
+    runs-on: ubuntu-22.04
+    name: Enforce rebasing
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Is Rebased on main?
+      uses: cyberark/enforce-rebase@v2
+      with:
+        default-branch: main
