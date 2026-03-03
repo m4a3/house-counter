@@ -78,10 +78,10 @@ env:
           fi
         continue-on-error: true
 
-  build_push_tag_app:
+   build_push_tag_app:
     runs-on: ubuntu-latest
-    needs: [release, detect-changes]
-    if: ${{ (needs.release.outputs.version_released == 'true' || github.event_name == 'workflow_dispatch') && needs.detect-changes.outputs.app == 'true' }}
+    needs: [release]  
+    if: ${{ needs.release.outputs.version_released == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
