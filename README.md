@@ -21,6 +21,17 @@ The server runs on `http://localhost:8008`. Building data cache is persisted in 
 
 To pass environment variables (e.g. `GOOGLE_TILES_API_KEY`), create a `.env` file in the project root before starting the container.
 
+#### Running from ECR (CI-built image)
+
+To use the image built and pushed by the GitHub Actions pipeline (e.g. on EC2):
+
+```bash
+export ECR_REGISTRY=123456789012.dkr.ecr.eu-west-1.amazonaws.com   # your account + region
+export IMAGE_TAG=main   # or a semver tag e.g. v1.0.0, or commit SHA
+aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+docker compose -f docker-compose.ecr.yml up -d
+```
+
 ### Local
 
 ```bash
