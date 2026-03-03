@@ -1,5 +1,4 @@
 name: Generate SemVer Tag and Build Env Versions
-
 on:
   push:
     branches: [ main-test ]
@@ -9,8 +8,7 @@ env:
   GH_PACKAGE_ACCESS_TOKEN: ${{ secrets.GH_PACKAGE_ACCESS_TOKEN }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_REGION: eu-west-1
-  AWS_DEFAULT_REGION: eu-west-1
+  AWS_REGION: eu-west-1  # Change to your AWS region
   ECR_REPO: house-counter-tags
 
 jobs:
@@ -24,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v2
         with:
           fetch-depth: 0  # Ensure all history is fetched, including tags
 
@@ -32,9 +30,9 @@ jobs:
         run: git fetch --tags
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v2
         with:
-          node-version: '20'
+          node-version: '14'
 
       - name: Fetch the current tag before release
         id: get_previous_tag
@@ -44,14 +42,14 @@ jobs:
             previous_tag="none"
           fi
           echo "Previous tag: $previous_tag"
-          echo "previous_tag=$previous_tag" >> $GITHUB_OUTPUT
+          echo "::set-output name=previous_tag::$previous_tag"
 
       - name: Generate Version Tag
-        uses: cycjimmy/semantic-release-action@v4
+        uses: cycjimmy/semantic-release-action@v2.5.4
         with:
-          semantic_version: 22
+          semantic_version: 18.0.0
           extra_plugins: |
-            @semantic-release/changelog
+            @semantic-release/changelog@5.0.1
             @semantic-release/git 
           branches: |
             ['main-test']
@@ -63,18 +61,18 @@ jobs:
         run: |
           current_tag=$(git tag --sort=creatordate | tail -n 1)
           echo "Current tag: $current_tag"
-          echo "current_tag=$current_tag" >> $GITHUB_OUTPUT
-          echo "tag_version=$current_tag" >> $GITHUB_OUTPUT
+          echo "::set-output name=current_tag::$current_tag"
+          echo "::set-output name=tag_version::$current_tag"
 
       - name: Compare tags and determine if a new version was released
         id: compare_tags
         run: |
           if [ "${{ steps.get_previous_tag.outputs.previous_tag }}" = "${{ steps.get_current_tag.outputs.current_tag }}" ]; then
             echo "No new tag was created. Setting version_released to false."
-            echo "version_released=false" >> $GITHUB_OUTPUT
+            echo "::set-output name=version_released::false"
           else
             echo "A new tag was created. Setting version_released to true."
-            echo "version_released=true" >> $GITHUB_OUTPUT
+            echo "::set-output name=version_released::true"
           fi
         continue-on-error: true
 
