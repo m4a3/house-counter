@@ -3,7 +3,7 @@ name: App Build
 on:
   pull_request:
     branches:
-      - 'main'
+      - 'main-test'
   workflow_dispatch:
 
 env:
