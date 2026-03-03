@@ -1,0 +1,19 @@
+# Use the image built and pushed by CI (ECR). Set before running:
+#   export ECR_REGISTRY=123456789012.dkr.ecr.eu-west-1.amazonaws.com
+#   export IMAGE_TAG=main  # or a semver tag e.g. v1.0.0, or commit SHA
+# Then: docker compose -f docker-compose.ecr.yml up -d
+# Log in to ECR first: aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+services:
+  house-counter:
+    image: ${ECR_REGISTRY}/house-counter:${IMAGE_TAG:-latest}
+    ports:
+      - "8008:8008"
+    volumes:
+      - building_cache:/app/building_cache
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  building_cache:
