@@ -1,157 +1,73 @@
-# House Counter API
+# Property APIs — Monorepo
 
-Count buildings within a given radius using Microsoft Building Footprints (ML-derived from satellite imagery), with optional map visualization using Google satellite tiles.
+Two Python/FastAPI services deployed together behind an nginx reverse proxy.
 
-## Features
+## Services
 
-- **Accurate Building Detection**: Uses Microsoft's ML-derived building footprints via Overture Maps
-- **No API Key Required**: All data sources are publicly accessible
-- **Visual Output**: Generate map images with Google satellite tiles as background
-- **Configurable Zoom**: Choose detail level for map output (trades speed for resolution)
+| Service | Path Prefix | Port | Description |
+|---|---|---|---|
+| [house-counter](house-counter/README.md) | `/buildings/` | 8008 | Count buildings within a radius using Microsoft Building Footprints |
+| [front-back-garden](front-back-garden/README.md) | `/garden/` | 8000 | Classify front/back gardens and place delivery pins using aerial imagery |
 
-## Installation
-
-### Docker (recommended)
+## Quick Start
 
 ```bash
+# Copy and fill in your API keys
+cp .env.example .env
+
+# Build and run all services locally
 docker compose up --build
 ```
 
-The server runs on `http://localhost:8008`. Building data cache is persisted in a Docker volume.
+- House Counter API: `http://localhost/buildings/count?lat=53.38&lon=-6.38&radius_km=1`
+- Garden Classifier API: `http://localhost/garden/docs`
 
-To pass environment variables (e.g. `GOOGLE_TILES_API_KEY`), create a `.env` file in the project root before starting the container.
+## Environment Variables
 
-#### Running from ECR (CI-built image)
+Create a `.env` file at the repo root:
 
-To use the image built and pushed by the GitHub Actions pipeline (e.g. on EC2):
+```
+GOOGLE_TILES_API_KEY=your-key-here
+```
+
+Both services read `GOOGLE_TILES_API_KEY` from this file.
+
+## Running on EC2 (from ECR)
 
 ```bash
-export ECR_REGISTRY=123456789012.dkr.ecr.eu-west-1.amazonaws.com   # your account + region
-export IMAGE_TAG=main   # or a semver tag e.g. v1.0.0, or commit SHA
-aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+export ECR_REGISTRY=245475270127.dkr.ecr.eu-west-1.amazonaws.com
+export IMAGE_TAG=main   # or a semver tag e.g. v1.0.0
+
+aws ecr get-login-password --region eu-west-1 \
+  | docker login --username AWS --password-stdin $ECR_REGISTRY
+
 docker compose -f docker-compose.ecr.yml up -d
 ```
 
-### Local
+## Repository Structure
+
+```
+/
+├── house-counter/          # Building count service
+│   ├── main.py
+│   ├── Dockerfile
+│   └── ...
+├── front-back-garden/      # Garden classifier service
+│   ├── api.py
+│   ├── Dockerfile
+│   └── ...
+├── nginx/
+│   └── nginx.conf          # Reverse proxy — routes by path prefix
+├── docker-compose.yml      # Local development (builds from source)
+├── docker-compose.ecr.yml  # Production (pulls from ECR)
+└── .github/workflows/
+    └── ci_build.yml        # Builds and pushes both images to ECR
+```
+
+## Updating front-back-garden (git subtree)
+
+The `front-back-garden/` directory is managed as a git subtree. To pull upstream changes:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python main.py
+git subtree pull --prefix front-back-garden https://github.com/tiernan-manna/front-back-garden.git main --squash
 ```
-
-The server runs on `http://localhost:8008`
-
-## API Endpoints
-
-### `GET /count`
-
-Count buildings within a radius. **Optimized for speed** - no map generation.
-
-```bash
-curl "http://localhost:8008/count?lat=36.060345&lon=-95.816314&radius_km=3"
-```
-
-**Response:**
-```json
-{
-  "latitude": 36.060345,
-  "longitude": -95.816314,
-  "radius_km": 3.0,
-  "building_count": 11308,
-  "total_area_sqm": 3921956.23,
-  "avg_building_area_sqm": 346.83,
-  "message": "Found 11308 buildings within 3.0km"
-}
-```
-
-### `GET /map`
-
-Get a PNG map image showing buildings in the area.
-
-```bash
-curl "http://localhost:8008/map?lat=36.060345&lon=-95.816314&radius_km=3" -o map.png
-
-# High resolution (zoom 17, ~5 min)
-curl "http://localhost:8008/map?lat=36.060345&lon=-95.816314&radius_km=3&zoom=17" -o map_hires.png
-```
-
-### `GET /count-with-map`
-
-Count buildings and save map image to disk.
-
-```bash
-curl "http://localhost:8008/count-with-map?lat=36.060345&lon=-95.816314&radius_km=3"
-```
-
-### `GET /zoom-info`
-
-Get zoom level options and timing estimates.
-
-```bash
-curl "http://localhost:8008/zoom-info?radius_km=3"
-```
-
-### `GET /compare`
-
-Compare building counts from Microsoft vs OpenStreetMap for validation testing.
-
-```bash
-curl "http://localhost:8008/compare?lat=36.060345&lon=-95.816314&radius_km=3"
-```
-
-**Response:**
-```json
-{
-  "latitude": 36.060345,
-  "longitude": -95.816314,
-  "radius_km": 3.0,
-  "microsoft": {
-    "building_count": 11308,
-    "total_area_sqm": 3921956.23,
-    "source": "Microsoft Building Footprints (ML from satellite)"
-  },
-  "osm": {
-    "building_count": 352,
-    "source": "OpenStreetMap (crowdsourced)"
-  },
-  "comparison": "Microsoft found +10956 more buildings (+3112.5%)"
-}
-```
-
-### `GET /compare-with-map`
-
-Compare counts and generate a map image.
-
-```bash
-curl "http://localhost:8008/compare-with-map?lat=36.060345&lon=-95.816314&radius_km=3"
-```
-
-## Zoom Levels
-
-For a 3km radius query:
-
-| Zoom | Tiles | Image Size | Time |
-|------|-------|------------|------|
-| 14 (default) | 25 | 1,280 px | ~5 sec |
-| 15 | 100 | 2,560 px | ~15 sec |
-| 16 | 400 | 5,120 px | ~1 min |
-| 17 | 1,600 | 10,240 px | ~5 min |
-| 18 | 6,400 | 20,480 px | ~20 min |
-
-## Data Sources
-
-- **Building Data**: [Overture Maps](https://overturemaps.org/) (includes Microsoft Building Footprints)
-- **Map Tiles**: Google Maps satellite imagery
-
-## How It Works
-
-1. **Building Count**: Queries pre-computed building polygons from Overture Maps (Microsoft's ML-derived footprints stored on AWS S3)
-2. **Map Generation**: Downloads Google satellite tiles, overlays building polygons in red, adds search radius circle
-
-The building detection was done offline by Microsoft using computer vision on satellite imagery. This API simply queries that pre-computed dataset.
-
-## License
-
-MIT
