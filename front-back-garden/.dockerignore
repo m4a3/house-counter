@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+venv/
+ENV/
+env/
+.venv/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+*.png
+output/
+config_local.py
+.env
+.env.local

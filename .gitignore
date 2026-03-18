@@ -19,8 +19,9 @@ env/
 # Generated map images
 *.png
 
-# Building cache directory
-building_cache/
+# Service caches and output
+house-counter/building_cache/
+front-back-garden/output/
 
 # Logs
 *.log
@@ -28,3 +29,9 @@ building_cache/
 # Environment
 .env
 .env.local
+
+# Local config overrides (contain API keys)
+config_local.py
+
+# Root-level building cache (house-counter runtime data)
+building_cache/
