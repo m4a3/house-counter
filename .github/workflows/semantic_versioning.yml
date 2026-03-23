@@ -49,10 +49,7 @@ jobs:
         with:
           semantic_version: 22
           extra_plugins: |
-            @semantic-release/changelog
-            @semantic-release/git 
-          branches: |
-            ['main']
+            @semantic-release/git
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
