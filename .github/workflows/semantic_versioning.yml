@@ -1,7 +1,7 @@
 name: Generate SemVer Tag and Build Env Versions
 on:
   push:
-    branches: [ main ]
+    branches: [ main-test ]
   workflow_dispatch:
 
 env:
