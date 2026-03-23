@@ -1,6 +1,10 @@
 name: App Build
 
-on: 
+concurrency:
+  group: ci-${{github.workflow}}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
   pull_request:
     branches:
       - 'main'
@@ -11,7 +15,7 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: eu-west-1
   AWS_DEFAULT_REGION: eu-west-1
-  ECR_URL: 245475270127.dkr.ecr.eu-west-1.amazonaws.com
+  ECR_REPO: house-counter-tags
 
 jobs:
   get-ref-name:
@@ -37,18 +41,6 @@ jobs:
     needs: [get-ref-name]
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: house-counter
-            ecr_repo: house-counter-tags
-            context: ./house-counter
-            dockerfile: ./house-counter/Dockerfile
-          - service: front-back-garden
-            ecr_repo: front-back-garden-tags
-            context: ./front-back-garden
-            dockerfile: ./front-back-garden/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -63,14 +55,59 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push ${{ matrix.service }} to Amazon ECR
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build, tag, and push house-counter image to Amazon ECR
+        id: docker_build_house_counter
         env:
+          ECR_URL: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ needs.get-ref-name.outputs.ref_name }}
-        run: |
-          docker build \
-            --build-arg APP_VERSION=$IMAGE_TAG \
-            --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            -t $ECR_URL/${{ matrix.ecr_repo }}:$IMAGE_TAG \
-            ${{ matrix.context }} \
-            -f ${{ matrix.dockerfile }}
-          docker push $ECR_URL/${{ matrix.ecr_repo }}:$IMAGE_TAG
+        uses: docker/build-push-action@v5
+        with:
+          context: house-counter
+          file: house-counter/Dockerfile
+          provenance: false
+          build-args: |
+            APP_VERSION=${{ env.IMAGE_TAG }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          cache-from: type=gha,scope=house-counter
+          cache-to: type=gha,mode=max,scope=house-counter
+          push: true
+          tags: |
+            ${{ env.ECR_URL }}/${{ env.ECR_REPO }}:house-counter-${{ env.IMAGE_TAG }}
+
+      - name: Build, tag, and push front-back-garden image to Amazon ECR
+        id: docker_build_front_back_garden
+        env:
+          ECR_URL: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.get-ref-name.outputs.ref_name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: front-back-garden
+          file: front-back-garden/Dockerfile
+          provenance: false
+          build-args: |
+            APP_VERSION=${{ env.IMAGE_TAG }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          cache-from: type=gha,scope=front-back-garden
+          cache-to: type=gha,mode=max,scope=front-back-garden
+          push: true
+          tags: |
+            ${{ env.ECR_URL }}/${{ env.ECR_REPO }}:front-back-garden-${{ env.IMAGE_TAG }}
+
+      - name: Build, tag, and push nginx image to Amazon ECR
+        id: docker_build_nginx
+        env:
+          ECR_URL: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.get-ref-name.outputs.ref_name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: nginx
+          file: nginx/Dockerfile
+          provenance: false
+          cache-from: type=gha,scope=nginx
+          cache-to: type=gha,mode=max,scope=nginx
+          push: true
+          tags: |
+            ${{ env.ECR_URL }}/${{ env.ECR_REPO }}:nginx-${{ env.IMAGE_TAG }}
