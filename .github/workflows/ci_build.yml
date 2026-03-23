@@ -106,6 +106,9 @@ jobs:
           context: nginx
           file: nginx/Dockerfile
           provenance: false
+          build-args: |
+            APP_VERSION=${{ env.IMAGE_TAG }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
           cache-from: type=gha,scope=nginx
           cache-to: type=gha,mode=max,scope=nginx
           push: true
