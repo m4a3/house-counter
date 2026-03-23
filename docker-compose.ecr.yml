@@ -7,7 +7,7 @@
 
 services:
   house-counter:
-    image: ${ECR_REGISTRY}/house-counter-tags:${IMAGE_TAG:-latest}
+    image: ${ECR_REGISTRY}/house-counter-tags:house-counter-${IMAGE_TAG:-latest}
     expose:
       - "8008"
     volumes:
@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   front-back-garden:
-    image: ${ECR_REGISTRY}/front-back-garden-tags:${IMAGE_TAG:-latest}
+    image: ${ECR_REGISTRY}/house-counter-tags:front-back-garden-${IMAGE_TAG:-latest}
     expose:
       - "8000"
     volumes:
@@ -27,11 +27,9 @@ services:
     restart: unless-stopped
 
   nginx:
-    image: nginx:alpine
+    image: ${ECR_REGISTRY}/house-counter-tags:nginx-${IMAGE_TAG:-latest}
     ports:
       - "80:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - house-counter
       - front-back-garden
