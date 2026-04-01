@@ -89,6 +89,12 @@ class PrecomputeManager:
     5. Find exactly ONE front + ONE back pin per building
     """
 
+    # Class-level tracking of in-progress precomputes, shared across all
+    # instances. Prevents concurrent requests for the same area from each
+    # spawning their own precompute, which doubles memory and causes OOM crashes.
+    _active_precomputes: Dict[str, threading.Event] = {}
+    _active_precomputes_lock: threading.Lock = threading.Lock()
+
     def __init__(
         self,
         cache_dir: Path = None,
@@ -201,6 +207,41 @@ class PrecomputeManager:
             except Exception:
                 pass
 
+        # Deduplication: if another thread is already computing this exact area,
+        # wait for it to finish then load from cache rather than running a second
+        # concurrent precompute (which would double memory and risk OOM crashes).
+        with PrecomputeManager._active_precomputes_lock:
+            if area_key in PrecomputeManager._active_precomputes:
+                existing_event = PrecomputeManager._active_precomputes[area_key]
+                if show_progress:
+                    print(f"Precompute already in progress for this area — waiting...")
+            else:
+                existing_event = None
+                done_event = threading.Event()
+                PrecomputeManager._active_precomputes[area_key] = done_event
+
+        if existing_event is not None:
+            existing_event.wait()
+            # The other thread has finished — load from cache
+            try:
+                with open(cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                elapsed = time.time() - start_time
+                if show_progress:
+                    print(f"Loaded from cache after waiting: {len(cached.delivery_pins)} pins")
+                return {
+                    "center_lat": center_lat,
+                    "center_lon": center_lon,
+                    "radius_m": radius_m,
+                    "total_pins": len(cached.delivery_pins),
+                    "total_buildings": cached.num_buildings,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "tile_source": self.tile_source.value,
+                    "from_cache": True,
+                }
+            except Exception:
+                return {"error": "Concurrent precompute finished but cache unreadable", "elapsed_seconds": time.time() - start_time}
+
         # ---- STEP 1: Fetch imagery (ONCE) ----
         if show_progress:
             print(f"[1/5] Fetching satellite imagery for {radius_m}m radius...")
@@ -216,6 +257,9 @@ class PrecomputeManager:
         )
 
         if image is None:
+            with PrecomputeManager._active_precomputes_lock:
+                PrecomputeManager._active_precomputes.pop(area_key, None)
+            done_event.set()
             return {"error": "Failed to fetch imagery", "elapsed_seconds": time.time() - start_time}
 
         geo_bounds = metadata["geo_bounds"]
@@ -293,6 +337,9 @@ class PrecomputeManager:
             }, center_lat, center_lon, radius_m)
 
         if buildings.empty:
+            with PrecomputeManager._active_precomputes_lock:
+                PrecomputeManager._active_precomputes.pop(area_key, None)
+            done_event.set()
             return {
                 "center_lat": center_lat,
                 "center_lon": center_lon,
@@ -936,6 +983,11 @@ class PrecomputeManager:
             print(f"   Back pins: {num_back}")
             print(f"   No garden: {num_no_garden}")
             print(f"   Total time: {elapsed:.1f}s")
+
+        # Signal any waiting threads that the precompute is done
+        with PrecomputeManager._active_precomputes_lock:
+            PrecomputeManager._active_precomputes.pop(area_key, None)
+        done_event.set()
 
         return {
             "center_lat": center_lat,
