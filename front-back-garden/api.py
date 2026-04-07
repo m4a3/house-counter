@@ -30,7 +30,9 @@ Endpoints:
 
 import asyncio
 import gc
+import json as _json
 import os
+import queue
 import signal
 import sys
 import time
@@ -43,6 +45,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
@@ -64,6 +67,9 @@ from src.osm import fetch_buildings
 # Thread pool for running CPU-intensive classification work
 # Keep low to limit memory: each task can hold large numpy arrays (~1-2 GB)
 _executor = ThreadPoolExecutor(max_workers=2)
+
+# Global semaphore: only one precompute job at a time to prevent OOM.
+_precompute_semaphore = asyncio.Semaphore(1)
 
 
 async def run_in_executor(func, *args, **kwargs):
@@ -758,15 +764,16 @@ async def get_garden_pins_batch(request: BatchPinRequest):
     # Check if area is precomputed
     is_cached = manager.is_area_cached(lat, lon, request.radius_m)
     
-    # Run in thread pool
-    pins = await run_in_executor(
-        manager.get_pins_in_radius,
-        lat,
-        lon,
-        request.radius_m,
-        request.garden_type,
-        request.min_score
-    )
+    # Acquire semaphore to prevent concurrent precomputes from OOMing
+    async with _precompute_semaphore:
+        pins = await run_in_executor(
+            manager.get_pins_in_radius,
+            lat,
+            lon,
+            request.radius_m,
+            request.garden_type,
+            request.min_score
+        )
     
     elapsed = time.time() - start_time
     
@@ -839,50 +846,71 @@ async def classify_point(request: ClassifyRequest):
     )
 
 
-@app.post("/api/precompute", response_model=PrecomputeResponse)
-async def precompute_area_endpoint(
-    request: PrecomputeRequest,
-    background_tasks: BackgroundTasks
-):
+@app.post("/api/precompute")
+async def precompute_area_endpoint(request: PrecomputeRequest):
     """
-    Precompute garden classification for a large area (FAST single-pass).
-    
-    NEW: Fetches all data ONCE for the entire area instead of per-chunk.
-    500m radius should take ~1-3 minutes instead of hours.
-    
-    Subsequent batch queries within this area will be nearly instant.
+    Precompute garden classification for a large area.
+
+    Returns a stream of Server-Sent Events with progress updates,
+    keeping the ALB connection alive during long-running jobs.
+    The final event contains the full result.
     """
     tile_source = get_tile_source(request.tile_source)
     manager = PrecomputeManager(tile_source=tile_source)
-    
-    # Check if already cached
-    if not request.skip_cache and manager.is_area_cached(request.lat, request.lon, request.radius_m):
-        return PrecomputeResponse(
-            status="completed",
-            message=f"Area already precomputed. Use /api/garden-pins/batch to query.",
-            summary={"from_cache": True}
-        )
-    
-    # Run synchronously in thread pool (much faster now - single pass)
-    summary = await run_in_executor(
-        manager.precompute_area,
-        request.lat,
-        request.lon,
-        request.radius_m,
-        True,  # parallel (unused in new arch but kept for compat)
-        True   # show_progress
-    )
-    
-    # Release memory from heavy precompute processing
-    gc.collect()
 
-    return PrecomputeResponse(
-        status="completed",
-        message=f"Precomputed {summary.get('total_buildings', 0)} buildings, "
-                f"{summary.get('total_pins', 0)} pins in "
-                f"{summary.get('elapsed_seconds', 0):.1f}s",
-        summary=summary
-    )
+    if not request.skip_cache and manager.is_area_cached(request.lat, request.lon, request.radius_m):
+        async def _cached():
+            yield f"data: {_json.dumps({'status': 'completed', 'message': 'Already cached', 'summary': {'from_cache': True}})}\n\n"
+        return StreamingResponse(_cached(), media_type="text/event-stream")
+
+    progress_queue: queue.Queue = queue.Queue()
+
+    def _progress_cb(msg: str):
+        progress_queue.put(msg)
+
+    _sentinel = object()
+
+    def _run():
+        try:
+            summary = manager.precompute_area(
+                request.lat, request.lon, request.radius_m,
+                parallel=True, show_progress=True,
+                progress_callback=_progress_cb,
+            )
+            progress_queue.put(("__result__", summary))
+        except Exception as e:
+            progress_queue.put(("__error__", str(e)))
+        finally:
+            progress_queue.put(_sentinel)
+            gc.collect()
+
+    async def _stream():
+        async with _precompute_semaphore:
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(_executor, _run)
+
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        loop.run_in_executor(None, progress_queue.get, True, 30),
+                        timeout=35,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    yield f"data: {_json.dumps({'heartbeat': True})}\n\n"
+                    continue
+
+                if item is _sentinel:
+                    break
+                if isinstance(item, tuple) and len(item) == 2:
+                    tag, payload = item
+                    if tag == "__result__":
+                        yield f"data: {_json.dumps({'status': 'completed', 'summary': payload})}\n\n"
+                    elif tag == "__error__":
+                        yield f"data: {_json.dumps({'status': 'error', 'message': payload})}\n\n"
+                else:
+                    yield f"data: {_json.dumps({'progress': str(item)})}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/cache/stats", response_model=CacheStatsResponse)
