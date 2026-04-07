@@ -19,6 +19,7 @@ import json
 import os
 import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Callable, List, Tuple, Optional, Dict, Any, Set
@@ -258,18 +259,23 @@ class PrecomputeManager:
 
         # ---- SINGLE-PASS PIPELINE (radius <= CHUNK_THRESHOLD_M) ----
 
-        # ---- STEP 1: Fetch imagery (ONCE) ----
-        _log(f"[1/5] Fetching satellite imagery for {radius_m}m radius...")
+        # ---- STEPS 1+2: Fetch imagery and OSM data concurrently ----
+        # Both are network-bound and fully independent of each other.
+        _log(f"[1/5] Fetching satellite imagery + OSM data in parallel for {radius_m}m radius...")
         t0 = time.time()
 
-        image, metadata = fetch_area_image(
-            center_lat, center_lon,
-            radius_m=radius_m,
-            zoom=self.zoom,
-            show_progress=show_progress,
-            use_cache=True,
-            tile_source=self.tile_source,
-        )
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            _img_future = _pool.submit(
+                fetch_area_image,
+                center_lat, center_lon,
+                radius_m, self.zoom, show_progress, True, self.tile_source,
+            )
+            _osm_future = _pool.submit(
+                self._fetch_osm_data,
+                center_lat, center_lon, radius_m, _log,
+            )
+            image, metadata = _img_future.result()
+            buildings, roads, driveways, address_polygons, property_boundaries = _osm_future.result()
 
         if image is None:
             with PrecomputeManager._active_precomputes_lock:
@@ -280,70 +286,8 @@ class PrecomputeManager:
         geo_bounds = metadata["geo_bounds"]
         image_size = tuple(metadata["image_size"])
 
-        _log(f"    Image: {image_size[0]}x{image_size[1]} ({time.time()-t0:.1f}s)")
-
-        # ---- STEP 2: Fetch OSM data (ONCE, with cache) ----
-        _log("[2/5] Fetching OSM data...")
-        t0 = time.time()
-
-        osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
-        if osm_cached is not None:
-            buildings = osm_cached["buildings"]
-            roads = osm_cached["roads"]
-            driveways = osm_cached["driveways"]
-            address_polygons = osm_cached.get("address_polygons", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
-            property_boundaries = osm_cached.get("property_boundaries", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
-            _log(f"    OSM loaded from cache ({len(buildings)} buildings, "
-                 f"{len(roads)} roads, {len(driveways)} driveways, "
-                 f"{len(address_polygons)} addresses, "
-                 f"{len(property_boundaries)} boundaries) ({time.time()-t0:.1f}s)")
-        else:
-            buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
-            _log(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
-            
-            t1 = time.time()
-            roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
-            _log(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
-            
-            # Driveways, addresses, and boundaries are independent — fetch in parallel
-            t1 = time.time()
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            _empty_gdf = lambda: gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-
-            def _fetch_driveways():
-                return fetch_driveways(center_lat, center_lon, radius_m, show_progress=False)
-
-            def _fetch_addresses():
-                try:
-                    return fetch_address_polygons(center_lat, center_lon, radius_m, show_progress=False)
-                except Exception:
-                    return _empty_gdf()
-
-            def _fetch_boundaries():
-                try:
-                    return fetch_property_boundaries(center_lat, center_lon, radius_m, show_progress=False)
-                except Exception:
-                    return _empty_gdf()
-
-            with _TPE(max_workers=3) as pool:
-                fut_d = pool.submit(_fetch_driveways)
-                fut_a = pool.submit(_fetch_addresses)
-                fut_b = pool.submit(_fetch_boundaries)
-                driveways = fut_d.result()
-                address_polygons = fut_a.result()
-                property_boundaries = fut_b.result()
-
-            _log(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
-                 f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
-            _log(f"    OSM total: {time.time()-t0:.1f}s")
-
-            save_osm_to_cache({
-                "buildings": buildings,
-                "roads": roads,
-                "driveways": driveways,
-                "address_polygons": address_polygons,
-                "property_boundaries": property_boundaries,
-            }, center_lat, center_lon, radius_m)
+        _log(f"    Image: {image_size[0]}x{image_size[1]}, "
+             f"{len(buildings)} buildings ({time.time()-t0:.1f}s)")
 
         if buildings.empty:
             with PrecomputeManager._active_precomputes_lock:
@@ -1022,10 +966,16 @@ class PrecomputeManager:
                 core_min_x = -radius_m + ix * CHUNK_SIZE_M
                 core_max_x = core_min_x + CHUNK_SIZE_M
 
+                # Skip chunks whose rectangle has zero overlap with the
+                # circular area.  Find the closest point on the core rectangle
+                # to the origin and compare against the radius.
+                closest_x = max(core_min_x, min(0.0, core_max_x))
+                closest_y = max(core_min_y, min(0.0, core_max_y))
+                if closest_x ** 2 + closest_y ** 2 > radius_m ** 2:
+                    continue
+
                 cx = (core_min_x + core_max_x) / 2
                 cy = (core_min_y + core_max_y) / 2
-                if np.sqrt(cx ** 2 + cy ** 2) > radius_m + CHUNK_SIZE_M:
-                    continue
 
                 full_min_y = core_min_y - CHUNK_OVERLAP_M
                 full_max_y = core_max_y + CHUNK_OVERLAP_M
@@ -1047,17 +997,20 @@ class PrecomputeManager:
 
                 chunk_center_lat = center_lat + cy * lat_per_m
                 chunk_center_lon = center_lon + cx * lon_per_m
-                half_diag = np.sqrt(
-                    (full_max_x - full_min_x) ** 2 +
-                    (full_max_y - full_min_y) ** 2
-                ) / 2.0
+                # Use the half-side-length (not half-diagonal) as the fetch
+                # radius. fetch_area_image fetches a square bounding box, so
+                # the half-diagonal would over-fetch the wasted corner tiles.
+                chunk_fetch_radius = max(
+                    (full_max_x - full_min_x) / 2.0,
+                    (full_max_y - full_min_y) / 2.0,
+                )
 
                 chunks.append({
                     "core_bounds": core_bounds,
                     "full_bounds": full_bounds,
                     "center_lat": chunk_center_lat,
                     "center_lon": chunk_center_lon,
-                    "radius_m": half_diag,
+                    "radius_m": chunk_fetch_radius,
                 })
         return chunks
 
@@ -1311,8 +1264,34 @@ class PrecomputeManager:
     ) -> Dict[str, Any]:
         """Process a large area by dividing into chunks to cap peak memory."""
 
-        buildings, roads, driveways, address_polygons, property_boundaries = \
-            self._fetch_osm_data(center_lat, center_lon, radius_m, _log)
+        # Generate the chunk grid first so we know chunk 0 before OSM arrives.
+        chunks_early = self._generate_chunk_grid(center_lat, center_lon, radius_m)
+
+        def _fetch_chunk0_tile():
+            if not chunks_early:
+                return None, None
+            c0 = chunks_early[0]
+            # Skip tile fetch if chunk 0 already has a saved partial result.
+            c0_cache = cache_path.parent / f"{cache_path.stem}_chunk0.pkl"
+            if c0_cache.exists():
+                return None, None
+            return fetch_area_image(
+                c0["center_lat"], c0["center_lon"],
+                radius_m=c0["radius_m"],
+                zoom=self.zoom, show_progress=False,
+                use_cache=True, tile_source=self.tile_source,
+            )
+
+        # Fetch OSM for the full area and the first chunk's tiles concurrently.
+        _log("[1/3] Fetching OSM data + first chunk tiles in parallel...")
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            _osm_fut = _pool.submit(self._fetch_osm_data, center_lat, center_lon, radius_m, _log)
+            _tile0_fut = _pool.submit(_fetch_chunk0_tile)
+            buildings, roads, driveways, address_polygons, property_boundaries = _osm_fut.result()
+            _chunk0_image, _chunk0_meta = _tile0_fut.result()
+
+        # Stash the prefetched chunk-0 result so the loop can pick it up.
+        self._prefetched_chunk0 = (_chunk0_image, _chunk0_meta)
 
         if buildings.empty:
             with PrecomputeManager._active_precomputes_lock:
@@ -1326,52 +1305,140 @@ class PrecomputeManager:
             }
 
         chunks = self._generate_chunk_grid(center_lat, center_lon, radius_m)
-        _log(f"[2/3] Processing {len(chunks)} chunks "
+        n_chunks = len(chunks)
+        _log(f"[2/3] Processing {n_chunks} chunks "
              f"({CHUNK_SIZE_M}m grid, {CHUNK_OVERLAP_M}m overlap)...")
 
         all_pins: List[DeliveryPin] = []
 
-        for ci, chunk in enumerate(chunks):
-            _log(f"    Chunk {ci + 1}/{len(chunks)}...")
-
-            # Filter OSM data to chunk full bounds
-            fb = chunk["full_bounds"]
-            cb = chunk["core_bounds"]
-            c_buildings = buildings[buildings.intersects(fb)].copy()
-            c_roads = roads[roads.intersects(fb)].copy()
-            c_driveways = driveways[driveways.intersects(fb)].copy() if not driveways.empty else driveways
-            _empty = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-            c_addr = address_polygons[address_polygons.intersects(fb)].copy() if not address_polygons.empty else _empty
-            c_prop = property_boundaries[property_boundaries.intersects(fb)].copy() if not property_boundaries.empty else _empty
-
-            if c_buildings.empty:
-                continue
-
-            # Reset index so positional indexing works correctly in the pipeline
-            c_buildings = c_buildings.reset_index(drop=True)
-            c_roads = c_roads.reset_index(drop=True)
-            c_driveways = c_driveways.reset_index(drop=True)
-            c_addr = c_addr.reset_index(drop=True)
-            c_prop = c_prop.reset_index(drop=True)
-
-            image, metadata = fetch_area_image(
+        def _fetch_tile(chunk: Dict[str, Any]):
+            return fetch_area_image(
                 chunk["center_lat"], chunk["center_lon"],
                 radius_m=chunk["radius_m"],
                 zoom=self.zoom, show_progress=False,
                 use_cache=True, tile_source=self.tile_source,
             )
-            if image is None:
-                continue
 
-            geo_bounds = metadata["geo_bounds"]
-            image_size = tuple(metadata["image_size"])
+        # Chunk 0's tile was already fetched concurrently with the OSM data above.
+        # From chunk 1 onwards, two prefetch workers overlap the next two chunks'
+        # tile downloads with the current chunk's CPU-bound processing.
+        _tile_executor = ThreadPoolExecutor(max_workers=2)
 
-            chunk_pins = self._process_chunk_pins(
-                image, geo_bounds, image_size,
-                c_buildings, c_roads, c_driveways, c_addr, c_prop,
-                center_lat, center_lon, cb,
-            )
-            all_pins.extend(chunk_pins)
+        def _first_pending(start: int) -> int:
+            for i in range(start, n_chunks):
+                p = cache_path.parent / f"{cache_path.stem}_chunk{i}.pkl"
+                if not p.exists():
+                    return i
+            return n_chunks
+
+        # Seed the prefetch queue with the next two uncached chunks so downloads
+        # start immediately and overlap with processing of earlier chunks.
+        first_ci = _first_pending(0)
+        chunk0_cached = (cache_path.parent / f"{cache_path.stem}_chunk0.pkl").exists()
+
+        # Map: chunk index → Future (at most 2 in-flight at any time)
+        _prefetch_futures: dict[int, Future] = {}
+
+        def _schedule_prefetch(start_ci: int, count: int = 2) -> None:
+            """Queue tile fetches for up to `count` pending chunks from start_ci."""
+            ci = start_ci
+            queued = 0
+            while ci < n_chunks and queued < count:
+                if ci not in _prefetch_futures and not (
+                    cache_path.parent / f"{cache_path.stem}_chunk{ci}.pkl"
+                ).exists():
+                    _prefetch_futures[ci] = _tile_executor.submit(_fetch_tile, chunks[ci])
+                    queued += 1
+                ci += 1
+
+        if first_ci == 0:
+            # Chunk 0 tile was already fetched with OSM; pre-fetch chunks 1 and 2.
+            _schedule_prefetch(1, count=2)
+        else:
+            # All early chunks cached; pre-fetch next two pending ones.
+            _schedule_prefetch(first_ci, count=2)
+
+        # Legacy single-future tracking removed in favour of _prefetch_futures dict.
+        prefetch_future = None   # unused but kept to avoid NameError in fallback path
+        prefetch_for_ci = -1
+
+        try:
+            for ci, chunk in enumerate(chunks):
+                chunk_cache_path = cache_path.parent / f"{cache_path.stem}_chunk{ci}.pkl"
+
+                # Resume from partial cache if available.
+                if chunk_cache_path.exists():
+                    try:
+                        with open(chunk_cache_path, "rb") as f:
+                            saved_pins = pickle.load(f)
+                        _log(f"    Chunk {ci + 1}/{n_chunks}... resumed from partial cache "
+                             f"({len(saved_pins)} pins)")
+                        all_pins.extend(saved_pins)
+                        # This chunk was already cached — if we queued a prefetch
+                        # for it, cancel it and advance to the next pending chunk.
+                        if ci in _prefetch_futures:
+                            _prefetch_futures.pop(ci).cancel()
+                            _schedule_prefetch(ci + 1, count=2 - len(_prefetch_futures))
+                        continue
+                    except Exception:
+                        chunk_cache_path.unlink(missing_ok=True)
+
+                _log(f"    Chunk {ci + 1}/{n_chunks}...")
+
+                # Retrieve tiles: prefer pre-fetched results, fall back to blocking fetch.
+                if ci == 0 and hasattr(self, "_prefetched_chunk0") and self._prefetched_chunk0[0] is not None:
+                    image, metadata = self._prefetched_chunk0
+                    self._prefetched_chunk0 = (None, None)
+                elif ci in _prefetch_futures:
+                    image, metadata = _prefetch_futures.pop(ci).result()
+                else:
+                    image, metadata = _fetch_tile(chunk)
+
+                # Replenish the prefetch queue: keep 2 chunks downloading at all times.
+                _schedule_prefetch(ci + 1, count=2 - len(_prefetch_futures))
+
+                if image is None:
+                    continue
+
+                # Filter OSM data to chunk full bounds.
+                fb = chunk["full_bounds"]
+                cb = chunk["core_bounds"]
+                c_buildings = buildings[buildings.intersects(fb)].copy()
+                c_roads = roads[roads.intersects(fb)].copy()
+                c_driveways = driveways[driveways.intersects(fb)].copy() if not driveways.empty else driveways
+                _empty = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                c_addr = address_polygons[address_polygons.intersects(fb)].copy() if not address_polygons.empty else _empty
+                c_prop = property_boundaries[property_boundaries.intersects(fb)].copy() if not property_boundaries.empty else _empty
+
+                if c_buildings.empty:
+                    continue
+
+                c_buildings = c_buildings.reset_index(drop=True)
+                c_roads = c_roads.reset_index(drop=True)
+                c_driveways = c_driveways.reset_index(drop=True)
+                c_addr = c_addr.reset_index(drop=True)
+                c_prop = c_prop.reset_index(drop=True)
+
+                geo_bounds = metadata["geo_bounds"]
+                image_size = tuple(metadata["image_size"])
+
+                chunk_pins = self._process_chunk_pins(
+                    image, geo_bounds, image_size,
+                    c_buildings, c_roads, c_driveways, c_addr, c_prop,
+                    center_lat, center_lon, cb,
+                )
+                del image  # release tile memory before next chunk arrives
+
+                # Persist chunk pins so an interrupted run can resume here.
+                try:
+                    with open(chunk_cache_path, "wb") as f:
+                        pickle.dump(chunk_pins, f)
+                except Exception:
+                    pass
+
+                all_pins.extend(chunk_pins)
+        finally:
+            _tile_executor.shutdown(wait=False, cancel_futures=True)
 
         # Global post-processing: neighbor consistency
         _log(f"[3/3] Post-processing {len(all_pins)} pins...")
@@ -1440,6 +1507,10 @@ class PrecomputeManager:
         try:
             with open(cache_path, "wb") as f:
                 pickle.dump(precomputed, f)
+            # Clean up per-chunk sidecar files now that the full result is saved.
+            for ci in range(len(chunks)):
+                sidecar = cache_path.parent / f"{cache_path.stem}_chunk{ci}.pkl"
+                sidecar.unlink(missing_ok=True)
         except Exception as e:
             warnings.warn(f"Failed to save cache: {e}")
 

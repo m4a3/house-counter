@@ -13,6 +13,7 @@ import json
 import math
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -644,7 +645,7 @@ def fetch_area_image(
         use_google = True
     
     print(f"Fetching {len(tiles)} tiles at zoom {zoom}...")
-    
+
     # Create session token for Google if needed
     session_token = None
     if use_google:
@@ -662,55 +663,74 @@ def fetch_area_image(
                 print("  3. Click 'Enable'")
                 print("\nFalling back to placeholder image...")
                 return create_placeholder_image(center_lat, center_lon, radius_m, zoom)
-    
+
     # Calculate output image size
     width_tiles = max_x - min_x + 1
     height_tiles = max_y - min_y + 1
     output_width = width_tiles * config.TILE_SIZE
     output_height = height_tiles * config.TILE_SIZE
-    
+
     # Create output image
     output = Image.new("RGB", (output_width, output_height))
-    
-    # Fetch tiles with connection pooling
-    http_session = requests.Session()
+
     failed_tiles = []
     successful_tiles = 0
-    
-    iterator = tqdm(tiles, desc="Fetching tiles") if show_progress else tiles
-    
-    for tile_x, tile_y in iterator:
-        # Check for shutdown request every iteration so Ctrl+C takes effect
-        if _shutdown_event.is_set():
-            print("\n⚠️  Shutdown requested – aborting tile fetch")
-            break
 
-        tile_img = None
-        
-        # Try primary source first
+    # Each worker gets its own requests.Session for thread safety.
+    # 24 workers is safe for both Google and Manna CDN-backed tile APIs.
+    _TILE_WORKERS = 24
+    _thread_local = threading.local()
+
+    def _get_session() -> requests.Session:
+        if not hasattr(_thread_local, "session"):
+            _thread_local.session = requests.Session()
+        return _thread_local.session
+
+    def _fetch_one(tile_xy):
+        tile_x, tile_y = tile_xy
+        if _shutdown_event.is_set():
+            return tile_x, tile_y, None
+        s = _get_session()
+        img = None
         if use_manna:
-            tile_img = fetch_manna_tile(tile_x, tile_y, zoom, http_session)
-        
-        # Fall back to Google if Manna fails
-        if tile_img is None and (use_google or (use_manna and session_token)):
-            if session_token is None:
+            img = fetch_manna_tile(tile_x, tile_y, zoom, s)
+        if img is None and (use_google or (use_manna and session_token)):
+            tok = session_token
+            if tok is None:
                 try:
-                    session_token = get_session_token()
+                    tok = get_session_token()
                 except Exception:
                     pass
-            if session_token:
-                tile_img = fetch_tile(tile_x, tile_y, zoom, session_token, http_session)
-        
-        if tile_img:
-            # Calculate position in output image
-            paste_x = (tile_x - min_x) * config.TILE_SIZE
-            paste_y = (tile_y - min_y) * config.TILE_SIZE
-            output.paste(tile_img, (paste_x, paste_y))
-            successful_tiles += 1
-        else:
-            failed_tiles.append((tile_x, tile_y))
-    
-    http_session.close()
+            if tok:
+                img = fetch_tile(tile_x, tile_y, zoom, tok, s)
+        return tile_x, tile_y, img
+
+    if show_progress:
+        from tqdm import tqdm as _tqdm
+        pbar = _tqdm(total=len(tiles), desc="Fetching tiles")
+    else:
+        pbar = None
+
+    with ThreadPoolExecutor(max_workers=_TILE_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, t): t for t in tiles}
+        for fut in as_completed(futures):
+            if _shutdown_event.is_set():
+                pool.shutdown(wait=False, cancel_futures=True)
+                print("\n⚠️  Shutdown requested – aborting tile fetch")
+                break
+            tile_x, tile_y, tile_img = fut.result()
+            if tile_img:
+                paste_x = (tile_x - min_x) * config.TILE_SIZE
+                paste_y = (tile_y - min_y) * config.TILE_SIZE
+                output.paste(tile_img, (paste_x, paste_y))
+                successful_tiles += 1
+            else:
+                failed_tiles.append((tile_x, tile_y))
+            if pbar is not None:
+                pbar.update(1)
+
+    if pbar is not None:
+        pbar.close()
     
     if failed_tiles:
         if successful_tiles == 0:
