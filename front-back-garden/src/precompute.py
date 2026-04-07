@@ -21,7 +21,7 @@ import pickle
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Set
+from typing import Callable, List, Tuple, Optional, Dict, Any, Set
 import threading
 import warnings
 
@@ -53,6 +53,11 @@ from src.delivery_pins import DeliveryPinFinder, DeliveryPin
 
 # Precomputation cache directory
 PRECOMPUTE_CACHE_DIR = Path(config.OUTPUT_DIR) / "precompute"
+
+# Radii above this threshold use chunked processing to cap peak memory.
+CHUNK_THRESHOLD_M = 500
+CHUNK_SIZE_M = 500
+CHUNK_OVERLAP_M = 100
 
 
 @dataclass
@@ -159,28 +164,27 @@ class PrecomputeManager:
         center_lon: float,
         radius_m: float,
         parallel: bool = True,
-        show_progress: bool = True
+        show_progress: bool = True,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """
-        Precompute all data for an area in a SINGLE PASS.
+        Precompute all data for an area.
 
-        Steps:
-        1. Check cache
-        2. Fetch imagery (one stitched image)
-        3. Fetch OSM data (one set of API calls)
-        4. Detect vegetation
-        5. Classify front/back
-        6. Find one pin per building per garden type
-        7. Cache results
+        Uses a single-pass pipeline for radii <= CHUNK_THRESHOLD_M and
+        chunked processing for larger radii to cap peak memory.
         """
         start_time = time.time()
 
-        # Auto-select a safe zoom for this radius so the stitched image
-        # stays within memory limits (~12k px per side → ~2-3 GB peak).
+        def _log(msg: str):
+            if show_progress:
+                print(msg)
+            if progress_callback is not None:
+                progress_callback(msg)
+
         safe_zoom = recommended_zoom(radius_m, center_lat, self._preferred_zoom)
-        if safe_zoom != self._preferred_zoom and show_progress:
-            print(f"⚠️  Zoom reduced {self._preferred_zoom} → {safe_zoom} "
-                  f"for {radius_m:.0f}m radius (image would exceed memory limits)")
+        if safe_zoom != self._preferred_zoom:
+            _log(f"Zoom reduced {self._preferred_zoom} -> {safe_zoom} "
+                 f"for {radius_m:.0f}m radius (image would exceed memory limits)")
         self.zoom = safe_zoom
 
         area_key = self._get_area_key(center_lat, center_lon, radius_m)
@@ -191,8 +195,7 @@ class PrecomputeManager:
             try:
                 with open(cache_path, "rb") as f:
                     cached = pickle.load(f)
-                if show_progress:
-                    print(f"Loaded from cache: {len(cached.delivery_pins)} pins")
+                _log(f"Loaded from cache: {len(cached.delivery_pins)} pins")
                 elapsed = time.time() - start_time
                 return {
                     "center_lat": center_lat,
@@ -213,8 +216,7 @@ class PrecomputeManager:
         with PrecomputeManager._active_precomputes_lock:
             if area_key in PrecomputeManager._active_precomputes:
                 existing_event = PrecomputeManager._active_precomputes[area_key]
-                if show_progress:
-                    print(f"Precompute already in progress for this area — waiting...")
+                _log("Precompute already in progress for this area — waiting...")
             else:
                 existing_event = None
                 done_event = threading.Event()
@@ -222,13 +224,11 @@ class PrecomputeManager:
 
         if existing_event is not None:
             existing_event.wait()
-            # The other thread has finished — load from cache
             try:
                 with open(cache_path, "rb") as f:
                     cached = pickle.load(f)
                 elapsed = time.time() - start_time
-                if show_progress:
-                    print(f"Loaded from cache after waiting: {len(cached.delivery_pins)} pins")
+                _log(f"Loaded from cache after waiting: {len(cached.delivery_pins)} pins")
                 return {
                     "center_lat": center_lat,
                     "center_lon": center_lon,
@@ -242,9 +242,24 @@ class PrecomputeManager:
             except Exception:
                 return {"error": "Concurrent precompute finished but cache unreadable", "elapsed_seconds": time.time() - start_time}
 
+        # For large radii, use chunked processing to cap peak memory.
+        if radius_m > CHUNK_THRESHOLD_M:
+            try:
+                return self._precompute_chunked(
+                    center_lat, center_lon, radius_m,
+                    show_progress, _log, area_key, cache_path,
+                    done_event, start_time,
+                )
+            except Exception as e:
+                with PrecomputeManager._active_precomputes_lock:
+                    PrecomputeManager._active_precomputes.pop(area_key, None)
+                done_event.set()
+                return {"error": str(e), "elapsed_seconds": time.time() - start_time}
+
+        # ---- SINGLE-PASS PIPELINE (radius <= CHUNK_THRESHOLD_M) ----
+
         # ---- STEP 1: Fetch imagery (ONCE) ----
-        if show_progress:
-            print(f"[1/5] Fetching satellite imagery for {radius_m}m radius...")
+        _log(f"[1/5] Fetching satellite imagery for {radius_m}m radius...")
         t0 = time.time()
 
         image, metadata = fetch_area_image(
@@ -265,12 +280,10 @@ class PrecomputeManager:
         geo_bounds = metadata["geo_bounds"]
         image_size = tuple(metadata["image_size"])
 
-        if show_progress:
-            print(f"    Image: {image_size[0]}x{image_size[1]} ({time.time()-t0:.1f}s)")
+        _log(f"    Image: {image_size[0]}x{image_size[1]} ({time.time()-t0:.1f}s)")
 
         # ---- STEP 2: Fetch OSM data (ONCE, with cache) ----
-        if show_progress:
-            print(f"[2/5] Fetching OSM data...")
+        _log("[2/5] Fetching OSM data...")
         t0 = time.time()
 
         osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
@@ -280,20 +293,17 @@ class PrecomputeManager:
             driveways = osm_cached["driveways"]
             address_polygons = osm_cached.get("address_polygons", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
             property_boundaries = osm_cached.get("property_boundaries", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
-            if show_progress:
-                print(f"    📦 OSM loaded from cache ({len(buildings)} buildings, "
-                      f"{len(roads)} roads, {len(driveways)} driveways, "
-                      f"{len(address_polygons)} addresses, "
-                      f"{len(property_boundaries)} boundaries) ({time.time()-t0:.1f}s)")
+            _log(f"    OSM loaded from cache ({len(buildings)} buildings, "
+                 f"{len(roads)} roads, {len(driveways)} driveways, "
+                 f"{len(address_polygons)} addresses, "
+                 f"{len(property_boundaries)} boundaries) ({time.time()-t0:.1f}s)")
         else:
             buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
-            if show_progress:
-                print(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
+            _log(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
             
             t1 = time.time()
             roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
-            if show_progress:
-                print(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
+            _log(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
             
             # Driveways, addresses, and boundaries are independent — fetch in parallel
             t1 = time.time()
@@ -323,10 +333,9 @@ class PrecomputeManager:
                 address_polygons = fut_a.result()
                 property_boundaries = fut_b.result()
 
-            if show_progress:
-                print(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
-                      f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
-                print(f"    OSM total: {time.time()-t0:.1f}s")
+            _log(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
+                 f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
+            _log(f"    OSM total: {time.time()-t0:.1f}s")
 
             save_osm_to_cache({
                 "buildings": buildings,
@@ -352,8 +361,7 @@ class PrecomputeManager:
             }
 
         # ---- STEP 3: Detect vegetation (ONCE) ----
-        if show_progress:
-            print(f"[3/5] Detecting vegetation...")
+        _log("[3/5] Detecting vegetation...")
         t0 = time.time()
 
         # Two-stage vegetation detection:
@@ -402,12 +410,10 @@ class PrecomputeManager:
             meters_per_pixel=mpp
         )
 
-        if show_progress:
-            print(f"    Vegetation detected ({time.time()-t0:.1f}s)")
+        _log(f"    Vegetation detected ({time.time()-t0:.1f}s)")
 
         # ---- STEP 4: Classify front/back (ONCE) ----
-        if show_progress:
-            print(f"[4/5] Classifying front/back gardens...")
+        _log("[4/5] Classifying front/back gardens...")
         t0 = time.time()
 
         classifier = GardenClassifier(
@@ -454,14 +460,12 @@ class PrecomputeManager:
         classification_mask = classifier.classify_mask_fast(spatial_mask, show_progress=False)
         del spatial_mask
 
-        if show_progress:
-            print(f"    Classification complete ({time.time()-t0:.1f}s)")
+        _log(f"    Classification complete ({time.time()-t0:.1f}s)")
 
         gc.collect()
 
         # ---- STEP 5: Find pins - ONE per building per garden type ----
-        if show_progress:
-            print(f"[5/5] Finding delivery pins for {len(buildings)} buildings...")
+        _log(f"[5/5] Finding delivery pins for {len(buildings)} buildings...")
         t0 = time.time()
 
         pin_finder = DeliveryPinFinder(
@@ -634,8 +638,8 @@ class PrecomputeManager:
 
         del _road_dist_val
 
-        if show_progress and swapped_count > 0:
-            print(f"    Front/back swap correction: {swapped_count} buildings fixed")
+        if swapped_count > 0:
+            _log(f"    Front/back swap correction: {swapped_count} buildings fixed")
 
         # ---- POST-PROCESSING: Same-side pin correction ----
         # When front and back pins are very close together, they're in the
@@ -751,8 +755,8 @@ class PrecomputeManager:
 
         del _road_dist
 
-        if show_progress and same_side_fixed > 0:
-            print(f"    Same-side pin correction: {same_side_fixed} buildings relocated, {same_side_label_swapped} labels swapped")
+        if same_side_fixed > 0:
+            _log(f"    Same-side pin correction: {same_side_fixed} buildings relocated, {same_side_label_swapped} labels swapped")
 
         # ---- POST-PROCESSING: Address-road distance label fix ----
         # For buildings matched to a named street, measure each pin's
@@ -842,8 +846,8 @@ class PrecomputeManager:
 
             del roads_m_pp, buildings_m_pp, addrs_m_pp
 
-        if show_progress and addr_road_fixed > 0:
-            print(f"    Address-road distance fix: {addr_road_fixed} buildings corrected")
+        if addr_road_fixed > 0:
+            _log(f"    Address-road distance fix: {addr_road_fixed} buildings corrected")
 
         # ---- POST-PROCESSING: Neighbor consistency (conservative) ----
         # Only fix buildings that weren't already corrected by the
@@ -908,27 +912,25 @@ class PrecomputeManager:
                         nc_dirs[i] = (-d[0], -d[1])
                         neighbor_fixed += 1
 
-        if show_progress and neighbor_fixed > 0:
-            print(f"    Neighbor consistency fix: {neighbor_fixed} buildings corrected")
+        if neighbor_fixed > 0:
+            _log(f"    Neighbor consistency fix: {neighbor_fixed} buildings corrected")
 
-        if show_progress:
-            # Report attempt distribution
-            from collections import Counter
-            attempt_counts = Counter()
-            for p in all_pins:
-                att = p.metadata.get("attempt", 0)
-                attempt_counts[att] += 1
-            total_with_attempt = sum(v for k, v in attempt_counts.items() if k > 0)
-            if total_with_attempt > 0:
-                parts = []
-                for att in sorted(attempt_counts.keys()):
-                    if att == 0:
-                        continue
-                    count = attempt_counts[att]
-                    pct = 100 * count / total_with_attempt
-                    parts.append(f"A{att}={count}({pct:.0f}%)")
-                print(f"    Attempt stats: {', '.join(parts)}, no_garden={attempt_counts.get(0, 0)}")
-            print(f"    Found {len(all_pins)} pins ({time.time()-t0:.1f}s)")
+        from collections import Counter
+        attempt_counts = Counter()
+        for p in all_pins:
+            att = p.metadata.get("attempt", 0)
+            attempt_counts[att] += 1
+        total_with_attempt = sum(v for k, v in attempt_counts.items() if k > 0)
+        if total_with_attempt > 0:
+            parts = []
+            for att in sorted(attempt_counts.keys()):
+                if att == 0:
+                    continue
+                count = attempt_counts[att]
+                pct = 100 * count / total_with_attempt
+                parts.append(f"A{att}={count}({pct:.0f}%)")
+            _log(f"    Attempt stats: {', '.join(parts)}, no_garden={attempt_counts.get(0, 0)}")
+        _log(f"    Found {len(all_pins)} pins ({time.time()-t0:.1f}s)")
 
         # Save count before freeing references
         num_buildings = len(buildings)
@@ -976,13 +978,9 @@ class PrecomputeManager:
 
         elapsed = time.time() - start_time
 
-        if show_progress:
-            print(f"\nPrecompute complete:")
-            print(f"   Buildings: {num_buildings}")
-            print(f"   Front pins: {num_front}")
-            print(f"   Back pins: {num_back}")
-            print(f"   No garden: {num_no_garden}")
-            print(f"   Total time: {elapsed:.1f}s")
+        _log(f"Precompute complete: {num_buildings} buildings, "
+             f"{num_front} front, {num_back} back, "
+             f"{num_no_garden} no_garden, {elapsed:.1f}s")
 
         # Signal any waiting threads that the precompute is done
         with PrecomputeManager._active_precomputes_lock:
@@ -1000,6 +998,476 @@ class PrecomputeManager:
             "num_no_garden": num_no_garden,
             "elapsed_seconds": round(elapsed, 2),
             "tile_source": self.tile_source.value if hasattr(self.tile_source, 'value') else str(self.tile_source),
+            "from_cache": False,
+        }
+
+    # ------------------------------------------------------------------
+    # Chunked processing for large radii
+    # ------------------------------------------------------------------
+
+    def _generate_chunk_grid(
+        self, center_lat: float, center_lon: float, radius_m: float,
+    ) -> List[Dict[str, Any]]:
+        """Generate a grid of chunks covering the circular area."""
+        cos_lat = np.cos(np.radians(center_lat))
+        lat_per_m = 1.0 / 111320
+        lon_per_m = 1.0 / (111320 * cos_lat)
+
+        n = int(np.ceil(2 * radius_m / CHUNK_SIZE_M))
+        chunks = []
+        for iy in range(n):
+            for ix in range(n):
+                core_min_y = -radius_m + iy * CHUNK_SIZE_M
+                core_max_y = core_min_y + CHUNK_SIZE_M
+                core_min_x = -radius_m + ix * CHUNK_SIZE_M
+                core_max_x = core_min_x + CHUNK_SIZE_M
+
+                cx = (core_min_x + core_max_x) / 2
+                cy = (core_min_y + core_max_y) / 2
+                if np.sqrt(cx ** 2 + cy ** 2) > radius_m + CHUNK_SIZE_M:
+                    continue
+
+                full_min_y = core_min_y - CHUNK_OVERLAP_M
+                full_max_y = core_max_y + CHUNK_OVERLAP_M
+                full_min_x = core_min_x - CHUNK_OVERLAP_M
+                full_max_x = core_max_x + CHUNK_OVERLAP_M
+
+                core_bounds = box(
+                    center_lon + core_min_x * lon_per_m,
+                    center_lat + core_min_y * lat_per_m,
+                    center_lon + core_max_x * lon_per_m,
+                    center_lat + core_max_y * lat_per_m,
+                )
+                full_bounds = box(
+                    center_lon + full_min_x * lon_per_m,
+                    center_lat + full_min_y * lat_per_m,
+                    center_lon + full_max_x * lon_per_m,
+                    center_lat + full_max_y * lat_per_m,
+                )
+
+                chunk_center_lat = center_lat + cy * lat_per_m
+                chunk_center_lon = center_lon + cx * lon_per_m
+                half_diag = np.sqrt(
+                    (full_max_x - full_min_x) ** 2 +
+                    (full_max_y - full_min_y) ** 2
+                ) / 2.0
+
+                chunks.append({
+                    "core_bounds": core_bounds,
+                    "full_bounds": full_bounds,
+                    "center_lat": chunk_center_lat,
+                    "center_lon": chunk_center_lon,
+                    "radius_m": half_diag,
+                })
+        return chunks
+
+    def _fetch_osm_data(
+        self, center_lat: float, center_lon: float, radius_m: float,
+        _log: Callable[[str], None],
+    ) -> Tuple:
+        """Fetch all OSM data for an area, returning the five GeoDataFrames."""
+        _log("[1/3] Fetching OSM data for full area...")
+        t0 = time.time()
+
+        osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
+        if osm_cached is not None:
+            buildings = osm_cached["buildings"]
+            roads = osm_cached["roads"]
+            driveways = osm_cached["driveways"]
+            address_polygons = osm_cached.get(
+                "address_polygons",
+                gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"),
+            )
+            property_boundaries = osm_cached.get(
+                "property_boundaries",
+                gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"),
+            )
+            _log(f"    OSM from cache ({len(buildings)} buildings, "
+                 f"{len(roads)} roads) ({time.time()-t0:.1f}s)")
+        else:
+            buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
+            _log(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
+
+            t1 = time.time()
+            roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
+            _log(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
+
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _empty_gdf = lambda: gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+            def _fd():
+                return fetch_driveways(center_lat, center_lon, radius_m, show_progress=False)
+            def _fa():
+                try:
+                    return fetch_address_polygons(center_lat, center_lon, radius_m, show_progress=False)
+                except Exception:
+                    return _empty_gdf()
+            def _fb():
+                try:
+                    return fetch_property_boundaries(center_lat, center_lon, radius_m, show_progress=False)
+                except Exception:
+                    return _empty_gdf()
+
+            t1 = time.time()
+            with _TPE(max_workers=3) as pool:
+                driveways = pool.submit(_fd).result()
+                address_polygons = pool.submit(_fa).result()
+                property_boundaries = pool.submit(_fb).result()
+            _log(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
+                 f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
+
+            save_osm_to_cache({
+                "buildings": buildings,
+                "roads": roads,
+                "driveways": driveways,
+                "address_polygons": address_polygons,
+                "property_boundaries": property_boundaries,
+            }, center_lat, center_lon, radius_m)
+
+        return buildings, roads, driveways, address_polygons, property_boundaries
+
+    def _process_chunk_pins(
+        self,
+        image, geo_bounds, image_size,
+        buildings, roads, driveways, address_polygons, property_boundaries,
+        center_lat, center_lon,
+        core_bounds,
+    ) -> List[DeliveryPin]:
+        """Run vegetation→classify→pins pipeline on one chunk, returning pins for core buildings only."""
+        import cv2 as _cv2
+        from scipy.ndimage import distance_transform_edt as _edt
+
+        # Identify core buildings (centroid inside core area)
+        core_mask = buildings.geometry.centroid.within(core_bounds)
+        core_bld_indices = set(np.where(core_mask)[0])
+        if not core_bld_indices:
+            return []
+
+        # Vegetation detection
+        exg_threshold = 0.05 if self.zoom <= 17 else 0.08
+        vegetation_mask = detect_vegetation_enhanced(image, use_texture=False)
+
+        image_float = image.astype(np.float32) / 255.0
+        exg = 2 * image_float[:, :, 1] - image_float[:, :, 0] - image_float[:, :, 2]
+        vegetation_mask[exg < exg_threshold] = 0
+        del image_float, exg
+
+        building_polys_px = []
+        for _, b in buildings.iterrows():
+            coords = geometry_to_pixel_coords(b.geometry, geo_bounds, image_size)
+            if coords:
+                building_polys_px.append(coords)
+
+        road_lines_px = []
+        for _, r in roads.iterrows():
+            coords = geometry_to_pixel_coords(r.geometry, geo_bounds, image_size)
+            if coords:
+                road_lines_px.append(coords)
+
+        vegetation_mask = exclude_buildings_from_mask(vegetation_mask, building_polys_px)
+        vegetation_mask = exclude_roads_from_mask(vegetation_mask, road_lines_px, road_width_px=8)
+
+        mpp = ((geo_bounds["east"] - geo_bounds["west"]) *
+               111320 * np.cos(np.radians(center_lat)) / image_size[0])
+        grass_mask, tree_mask = split_vegetation_by_texture(
+            image, vegetation_mask,
+            building_polys_px=building_polys_px,
+            meters_per_pixel=mpp,
+        )
+        grass_mask = recover_shaded_grass(
+            image, grass_mask, tree_mask,
+            building_polys_px, road_lines_px,
+            meters_per_pixel=mpp,
+        )
+
+        # Classification
+        classifier = GardenClassifier(
+            buildings=buildings, roads=roads,
+            geo_bounds=geo_bounds, image_size=image_size,
+            center_lat=center_lat, center_lon=center_lon,
+            driveways=driveways, exclusion_zones=None,
+            property_boundaries=None,
+            address_polygons=address_polygons,
+        )
+
+        height_px, width_px = image_size[1], image_size[0]
+        bld_mask = np.zeros((height_px, width_px), dtype=np.uint8)
+        for poly in building_polys_px:
+            if len(poly) >= 3:
+                _cv2.fillPoly(bld_mask, [np.array(poly, dtype=np.int32)], 255)
+        road_mask = np.zeros((height_px, width_px), dtype=np.uint8)
+        for rline in road_lines_px:
+            if len(rline) >= 2:
+                _cv2.polylines(road_mask, [np.array(rline, dtype=np.int32)], False, 255, thickness=8)
+        dist_bld = _edt(bld_mask == 0) * mpp
+        spatial_mask = np.zeros((height_px, width_px), dtype=np.uint8)
+        spatial_mask[(dist_bld < 20) & (bld_mask == 0) & (road_mask == 0)] = 255
+        del bld_mask, road_mask, dist_bld
+
+        classification_mask = classifier.classify_mask_fast(spatial_mask, show_progress=False)
+        del spatial_mask
+
+        # Pin finding — only for core buildings
+        pin_finder = DeliveryPinFinder(
+            classification_mask=classification_mask,
+            vegetation_mask=grass_mask,
+            buildings=buildings, roads=roads, driveways=driveways,
+            geo_bounds=geo_bounds, image_size=image_size,
+            center_lat=center_lat, center_lon=center_lon,
+            building_directions=getattr(classifier, "building_directions", None),
+            property_boundaries=property_boundaries,
+            tree_canopy_mask=tree_mask,
+            original_vegetation_mask=vegetation_mask,
+            building_polys_px=building_polys_px,
+            road_lines_px=road_lines_px,
+        )
+        _building_directions = getattr(classifier, "building_directions", {})
+        del image, vegetation_mask, classification_mask, grass_mask, tree_mask
+        del classifier, building_polys_px, road_lines_px
+        gc.collect()
+
+        chunk_pins: List[DeliveryPin] = []
+        seen: Set[str] = set()
+        for idx in range(len(buildings)):
+            if idx not in core_bld_indices:
+                continue
+            building = buildings.iloc[idx]
+            bid = (str(building["osm_id"]) if "osm_id" in building.index
+                   else str(building.name) if hasattr(building, "name") and building.name is not None
+                   else f"bld_{idx}")
+            if bid in seen:
+                continue
+            seen.add(bid)
+
+            front_pin = pin_finder.find_best_pin_for_building(idx, "front")
+            if front_pin:
+                front_pin.building_id = bid
+                chunk_pins.append(front_pin)
+            else:
+                centroid = building.geometry.centroid
+                elat, elon = centroid.y, centroid.x
+                di = _building_directions.get(buildings.index[idx])
+                if di:
+                    rd = di.get("direction_to_road")
+                    if rd is not None and np.linalg.norm(rd) > 0.1:
+                        elat += rd[1] * 5.0 / 111320
+                        elon += rd[0] * 5.0 / (111320 * np.cos(np.radians(center_lat)))
+                chunk_pins.append(DeliveryPin(
+                    lat=elat, lon=elon, garden_type="front", score=0.0,
+                    surface_type="no_garden", distance_to_building_m=0.0,
+                    building_id=bid, metadata={},
+                ))
+
+            back_pin = pin_finder.find_best_pin_for_building(idx, "back")
+            if back_pin:
+                back_pin.building_id = bid
+                chunk_pins.append(back_pin)
+            else:
+                centroid = building.geometry.centroid
+                elat, elon = centroid.y, centroid.x
+                di = _building_directions.get(buildings.index[idx])
+                if di:
+                    rd = di.get("direction_to_road")
+                    if rd is not None and np.linalg.norm(rd) > 0.1:
+                        elat -= rd[1] * 5.0 / 111320
+                        elon -= rd[0] * 5.0 / (111320 * np.cos(np.radians(center_lat)))
+                chunk_pins.append(DeliveryPin(
+                    lat=elat, lon=elon, garden_type="back", score=0.0,
+                    surface_type="no_garden", distance_to_building_m=0.0,
+                    building_id=bid, metadata={},
+                ))
+
+        # Per-chunk post-processing: front/back swap using pin_finder's road distances
+        _rd = pin_finder.distance_to_road
+        _h, _w = image_size[1], image_size[0]
+        pins_by_bld: Dict[str, Dict[str, DeliveryPin]] = {}
+        for p in chunk_pins:
+            pins_by_bld.setdefault(p.building_id, {})[p.garden_type] = p
+
+        for bid, bpins in pins_by_bld.items():
+            fp, bp = bpins.get("front"), bpins.get("back")
+            if fp is None or bp is None or fp.score == 0 or bp.score == 0:
+                continue
+            def _px(pin):
+                px = max(0, min(_w - 1, int((pin.lon - geo_bounds["west"]) / (geo_bounds["east"] - geo_bounds["west"]) * _w)))
+                py = max(0, min(_h - 1, int((geo_bounds["north"] - pin.lat) / (geo_bounds["north"] - geo_bounds["south"]) * _h)))
+                return py, px
+            fpy, fpx = _px(fp)
+            bpy, bpx = _px(bp)
+            if float(_rd[fpy, fpx]) > float(_rd[bpy, bpx]) * 1.05:
+                fp.garden_type, bp.garden_type = "back", "front"
+
+        del pin_finder, _rd, _building_directions
+        gc.collect()
+        return chunk_pins
+
+    def _precompute_chunked(
+        self,
+        center_lat: float, center_lon: float, radius_m: float,
+        show_progress: bool,
+        _log: Callable[[str], None],
+        area_key: str, cache_path: Path,
+        done_event: threading.Event, start_time: float,
+    ) -> Dict[str, Any]:
+        """Process a large area by dividing into chunks to cap peak memory."""
+
+        buildings, roads, driveways, address_polygons, property_boundaries = \
+            self._fetch_osm_data(center_lat, center_lon, radius_m, _log)
+
+        if buildings.empty:
+            with PrecomputeManager._active_precomputes_lock:
+                PrecomputeManager._active_precomputes.pop(area_key, None)
+            done_event.set()
+            return {
+                "center_lat": center_lat, "center_lon": center_lon,
+                "radius_m": radius_m, "total_pins": 0, "total_buildings": 0,
+                "elapsed_seconds": round(time.time() - start_time, 2),
+                "tile_source": self.tile_source.value, "from_cache": False,
+            }
+
+        chunks = self._generate_chunk_grid(center_lat, center_lon, radius_m)
+        _log(f"[2/3] Processing {len(chunks)} chunks "
+             f"({CHUNK_SIZE_M}m grid, {CHUNK_OVERLAP_M}m overlap)...")
+
+        all_pins: List[DeliveryPin] = []
+
+        for ci, chunk in enumerate(chunks):
+            _log(f"    Chunk {ci + 1}/{len(chunks)}...")
+
+            # Filter OSM data to chunk full bounds
+            fb = chunk["full_bounds"]
+            cb = chunk["core_bounds"]
+            c_buildings = buildings[buildings.intersects(fb)].copy()
+            c_roads = roads[roads.intersects(fb)].copy()
+            c_driveways = driveways[driveways.intersects(fb)].copy() if not driveways.empty else driveways
+            _empty = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+            c_addr = address_polygons[address_polygons.intersects(fb)].copy() if not address_polygons.empty else _empty
+            c_prop = property_boundaries[property_boundaries.intersects(fb)].copy() if not property_boundaries.empty else _empty
+
+            if c_buildings.empty:
+                continue
+
+            # Reset index so positional indexing works correctly in the pipeline
+            c_buildings = c_buildings.reset_index(drop=True)
+            c_roads = c_roads.reset_index(drop=True)
+            c_driveways = c_driveways.reset_index(drop=True)
+            c_addr = c_addr.reset_index(drop=True)
+            c_prop = c_prop.reset_index(drop=True)
+
+            image, metadata = fetch_area_image(
+                chunk["center_lat"], chunk["center_lon"],
+                radius_m=chunk["radius_m"],
+                zoom=self.zoom, show_progress=False,
+                use_cache=True, tile_source=self.tile_source,
+            )
+            if image is None:
+                continue
+
+            geo_bounds = metadata["geo_bounds"]
+            image_size = tuple(metadata["image_size"])
+
+            chunk_pins = self._process_chunk_pins(
+                image, geo_bounds, image_size,
+                c_buildings, c_roads, c_driveways, c_addr, c_prop,
+                center_lat, center_lon, cb,
+            )
+            all_pins.extend(chunk_pins)
+
+        # Global post-processing: neighbor consistency
+        _log(f"[3/3] Post-processing {len(all_pins)} pins...")
+        cos_lat = np.cos(np.radians(center_lat))
+        pins_by_bld: Dict[str, Dict[str, DeliveryPin]] = {}
+        for p in all_pins:
+            pins_by_bld.setdefault(p.building_id, {})[p.garden_type] = p
+
+        from scipy.spatial import cKDTree as _cKDTree
+        nc_bids: list = []
+        nc_dirs: list = []
+        nc_coords_m: list = []
+        for bid, bpins in pins_by_bld.items():
+            pa, pb = bpins.get("front"), bpins.get("back")
+            if pa is None or pb is None:
+                continue
+            fp_nc = pa if pa.garden_type == "front" else pb
+            bp_nc = pb if pa.garden_type == "front" else pa
+            if fp_nc.score == 0 or bp_nc.score == 0:
+                continue
+            dx = (fp_nc.lon - bp_nc.lon) * cos_lat
+            dy = fp_nc.lat - bp_nc.lat
+            length = np.sqrt(dx ** 2 + dy ** 2)
+            if length > 1e-9:
+                nc_bids.append(bid)
+                nc_dirs.append((dx / length, dy / length))
+                mid_lat = (fp_nc.lat + bp_nc.lat) / 2
+                mid_lon = (fp_nc.lon + bp_nc.lon) / 2
+                nc_coords_m.append((mid_lat * 111320, mid_lon * 111320 * cos_lat))
+
+        if nc_coords_m:
+            tree = _cKDTree(np.array(nc_coords_m))
+            neighbor_lists = tree.query_ball_tree(tree, r=20.0)
+            n_fixed = 0
+            for i, neighbors in enumerate(neighbor_lists):
+                d = nc_dirs[i]
+                agree = sum(1 for j in neighbors if j != i and d[0] * nc_dirs[j][0] + d[1] * nc_dirs[j][1] > 0)
+                disagree = sum(1 for j in neighbors if j != i and d[0] * nc_dirs[j][0] + d[1] * nc_dirs[j][1] <= 0)
+                if disagree >= 2 and agree == 0:
+                    pa = pins_by_bld[nc_bids[i]].get("front")
+                    pb = pins_by_bld[nc_bids[i]].get("back")
+                    if pa is not None and pb is not None:
+                        if pa.garden_type == "front":
+                            pa.garden_type, pb.garden_type = "back", "front"
+                        else:
+                            pa.garden_type, pb.garden_type = "front", "back"
+                        nc_dirs[i] = (-d[0], -d[1])
+                        n_fixed += 1
+            if n_fixed:
+                _log(f"    Neighbor consistency fix: {n_fixed} buildings corrected")
+
+        # Cache results
+        num_buildings = len(set(p.building_id for p in all_pins))
+        num_front = sum(1 for p in all_pins if p.garden_type == "front" and p.score > 0)
+        num_back = sum(1 for p in all_pins if p.garden_type == "back" and p.score > 0)
+        num_no_garden = sum(1 for p in all_pins if p.score == 0)
+
+        precomputed = PrecomputedArea(
+            center_lat=center_lat, center_lon=center_lon,
+            radius_m=radius_m, zoom=self.zoom,
+            tile_source=self.tile_source.value if hasattr(self.tile_source, "value") else str(self.tile_source),
+            computed_at=time.time(), num_buildings=num_buildings,
+            num_front_gardens=num_front, num_back_gardens=num_back,
+            delivery_pins=[pin.to_dict() for pin in all_pins],
+        )
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(precomputed, f)
+        except Exception as e:
+            warnings.warn(f"Failed to save cache: {e}")
+
+        with self._lock:
+            self.index[area_key] = {
+                "lat": center_lat, "lon": center_lon,
+                "radius_m": radius_m, "computed_at": precomputed.computed_at,
+                "num_pins": len(all_pins), "num_buildings": num_buildings,
+            }
+        self._save_index()
+
+        elapsed = time.time() - start_time
+        _log(f"Chunked precompute complete: {num_buildings} buildings, "
+             f"{num_front} front, {num_back} back, "
+             f"{num_no_garden} no_garden, {elapsed:.1f}s")
+
+        with PrecomputeManager._active_precomputes_lock:
+            PrecomputeManager._active_precomputes.pop(area_key, None)
+        done_event.set()
+
+        return {
+            "center_lat": center_lat, "center_lon": center_lon,
+            "radius_m": radius_m,
+            "total_pins": len(all_pins), "total_buildings": num_buildings,
+            "num_front": num_front, "num_back": num_back,
+            "num_no_garden": num_no_garden,
+            "elapsed_seconds": round(elapsed, 2),
+            "tile_source": self.tile_source.value if hasattr(self.tile_source, "value") else str(self.tile_source),
             "from_cache": False,
         }
 
@@ -1260,7 +1728,8 @@ def precompute_area(
     radius_m: float,
     tile_source: str = "auto",
     zoom: int = None,
-    parallel: bool = True
+    parallel: bool = True,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Convenience function to precompute an area."""
     source_map = {
@@ -1277,4 +1746,5 @@ def precompute_area(
         center_lon=center_lon,
         radius_m=radius_m,
         parallel=parallel,
+        progress_callback=progress_callback,
     )
