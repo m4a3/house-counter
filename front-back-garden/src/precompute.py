@@ -1397,6 +1397,11 @@ class PrecomputeManager:
 
             all_pins.extend(chunk_pins)
 
+        # Release the full image now that all chunks are cropped — it can be
+        # ~880 MB for a 3 km radius and is no longer needed.
+        del full_image
+        gc.collect()
+
         # Global post-processing: neighbor consistency
         _log(f"[3/3] Post-processing {len(all_pins)} pins...")
         cos_lat = np.cos(np.radians(center_lat))
