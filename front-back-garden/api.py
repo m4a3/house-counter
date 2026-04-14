@@ -45,7 +45,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
@@ -629,6 +629,12 @@ def get_tile_source(source_enum: TileSourceEnum) -> TileSource:
 # =============================================================================
 # API Endpoints
 # =============================================================================
+
+@app.get("/", response_class=FileResponse, include_in_schema=False)
+async def serve_ui():
+    """Serve the garden classifier UI."""
+    return FileResponse(Path(__file__).parent / "index.html")
+
 
 @app.get("/health")
 async def health_check():
