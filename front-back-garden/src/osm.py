@@ -26,9 +26,11 @@ import config
 # Suppress some OSMnx warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Configure OSMnx
+# Configure OSMnx — cache Overpass HTTP responses so repeated queries are instant
 ox.settings.use_cache = True
+ox.settings.cache_folder = str(Path(__file__).parent.parent / "output" / "cache" / "osmnx_http")
 ox.settings.log_console = False
+ox.settings.timeout = 60
 
 # Cache directory
 OSM_CACHE_DIR = Path(config.OUTPUT_DIR) / "cache" / "osm"
@@ -596,6 +598,142 @@ def fetch_driveways(
             pbar.close()
         print(f"Error fetching driveways: {e}")
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+
+def fetch_osm_features(
+    center_lat: float,
+    center_lon: float,
+    radius_m: float,
+) -> Dict[str, gpd.GeoDataFrame]:
+    """
+    Single Overpass API request for ALL OSM data needed.
+
+    Tags are merged by OSMnx into one QL query — one HTTP round-trip.
+    Roads (highway ways) are parsed from the same response; there is no
+    second graph_from_point call.  This avoids Overpass rate-limiting
+    caused by two simultaneous requests from the same IP.
+    """
+    _empty = lambda: gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    ox.settings.timeout = 60
+
+    # Only fetch the highway types we actually use for front/back classification.
+    # "highway": True would fetch every traffic-light node, bus stop, etc. —
+    # thousands of unwanted point features that bloat the response massively.
+    _road_types = [
+        "residential", "tertiary", "secondary", "primary",
+        "tertiary_link", "secondary_link", "primary_link",
+        "living_street", "unclassified",
+        "service",  # includes driveways (service + service=driveway)
+    ]
+
+    try:
+        all_feats = ox.features_from_point(
+            (center_lat, center_lon),
+            tags={
+                "building": True,
+                "highway": _road_types,
+                "addr:housenumber": True,
+                "barrier": ["fence", "wall", "hedge", "retaining_wall"],
+            },
+            dist=radius_m,
+        )
+    except Exception:
+        all_feats = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    def _col(df, name):
+        return df[name] if name in df.columns else pd.Series(dtype=object, index=df.index)
+
+    # ── Buildings ────────────────────────────────────────────────────────────
+    try:
+        bld_mask = _col(all_feats, "building").notna()
+        buildings = all_feats[bld_mask & all_feats.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+        cols = ["geometry"] + [c for c in ["building", "name", "addr:housenumber", "addr:street"] if c in buildings.columns]
+        buildings = buildings[cols].reset_index(drop=True)
+
+        if "building" in buildings.columns:
+            outbuilding_types = {
+                "shed", "garage", "garages", "carport", "outbuilding",
+                "barn", "greenhouse", "hut", "cabin", "storage",
+                "roof", "canopy", "shelter", "kiosk", "toilets",
+                "transformer_tower", "service", "ruins",
+            }
+            buildings = buildings[~buildings["building"].isin(outbuilding_types)].reset_index(drop=True)
+
+        if not buildings.empty:
+            bld_m = buildings.to_crs(epsg=32629)
+            buildings = buildings[bld_m.geometry.area > 30].reset_index(drop=True)
+    except Exception:
+        buildings = _empty()
+
+    # ── Roads — parsed from the same response, no second Overpass call ────────
+    front_road_types = {
+        "residential", "tertiary", "secondary", "primary",
+        "tertiary_link", "secondary_link", "primary_link",
+        "living_street", "unclassified",
+    }
+    try:
+        hw_col = _col(all_feats, "highway")
+        road_mask = hw_col.notna() & all_feats.geometry.type.isin(["LineString", "MultiLineString"])
+        roads_raw = all_feats[road_mask].copy()
+        cols = ["geometry"] + [c for c in ["highway", "name", "lanes", "oneway"] if c in roads_raw.columns]
+        roads_raw = roads_raw[cols].reset_index(drop=True)
+
+        if "highway" in roads_raw.columns:
+            def _is_front(hw):
+                if isinstance(hw, list):
+                    return any(t in front_road_types for t in hw)
+                return hw in front_road_types
+            roads = roads_raw[roads_raw["highway"].apply(_is_front)].reset_index(drop=True)
+        else:
+            roads = roads_raw
+    except Exception:
+        roads = _empty()
+
+    # ── Driveways ────────────────────────────────────────────────────────────
+    try:
+        hw_col  = _col(all_feats, "highway")
+        svc_col = _col(all_feats, "service")
+        driveways = all_feats[
+            (hw_col == "service") &
+            (svc_col == "driveway") &
+            all_feats.geometry.type.isin(["LineString", "MultiLineString"])
+        ][["geometry"]].reset_index(drop=True)
+    except Exception:
+        driveways = _empty()
+
+    # ── Address polygons ──────────────────────────────────────────────────────
+    try:
+        addr_mask = _col(all_feats, "addr:housenumber").notna()
+        address_polygons = all_feats[addr_mask & all_feats.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+        cols = ["geometry"] + [c for c in ["addr:housenumber", "addr:street", "addr:city"] if c in address_polygons.columns]
+        address_polygons = address_polygons[cols].reset_index(drop=True)
+    except Exception:
+        address_polygons = _empty()
+
+    # ── Property boundaries ───────────────────────────────────────────────────
+    try:
+        barrier_col = _col(all_feats, "barrier")
+        property_boundaries = all_feats[barrier_col.notna()][["geometry"]].reset_index(drop=True)
+    except Exception:
+        property_boundaries = _empty()
+
+    return {
+        "buildings": buildings,
+        "roads": roads,
+        "driveways": driveways,
+        "address_polygons": address_polygons,
+        "property_boundaries": property_boundaries,
+    }
+
+
+def fetch_osm_batch(
+    center_lat: float,
+    center_lon: float,
+    radius_m: float,
+) -> Dict[str, gpd.GeoDataFrame]:
+    """Convenience wrapper — delegates to fetch_osm_features (single request)."""
+    return fetch_osm_features(center_lat, center_lon, radius_m)
 
 
 def fetch_all_osm_data(

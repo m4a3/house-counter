@@ -33,6 +33,7 @@ import gc
 import json as _json
 import os
 import queue
+import threading
 import signal
 import sys
 import time
@@ -70,6 +71,98 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 # Global semaphore: only one precompute job at a time to prevent OOM.
 _precompute_semaphore = asyncio.Semaphore(1)
+
+
+# =============================================================================
+# Live job registry — allows clients to reconnect to in-progress precomputes
+# =============================================================================
+
+class _LiveJob:
+    """Tracks a running precompute job so late-joining SSE clients can catch up."""
+
+    def __init__(self, key: str, lat: float, lon: float, radius_m: float, tile_source: str):
+        self.key        = key
+        self.lat        = lat
+        self.lon        = lon
+        self.radius_m   = radius_m
+        self.tile_source = tile_source
+        self.started_at = time.time()
+        self.messages: list[str] = []   # full history (for replay)
+        self.done       = False
+        self.result     = None           # dict on success, str on error
+        self.is_error   = False
+        self._lock      = threading.Lock()
+
+    def push(self, msg: str):
+        with self._lock:
+            self.messages.append(msg)
+
+    def finish(self, result: dict):
+        with self._lock:
+            self.result = result
+            self.done   = True
+
+    def fail(self, error: str):
+        with self._lock:
+            self.result   = error
+            self.is_error = True
+            self.done     = True
+
+    def to_meta(self) -> dict:
+        with self._lock:
+            return {
+                "key":           self.key,
+                "lat":           self.lat,
+                "lon":           self.lon,
+                "radius_m":      self.radius_m,
+                "tile_source":   self.tile_source,
+                "started_at":    self.started_at,
+                "elapsed_s":     round(time.time() - self.started_at, 1),
+                "message_count": len(self.messages),
+                "done":          self.done,
+            }
+
+
+# Active jobs: key → _LiveJob.  Cleaned up after completion + 10 min.
+_live_jobs: dict[str, _LiveJob] = {}
+
+
+def _live_job_key(lat: float, lon: float, radius_m: float) -> str:
+    return f"{lat:.4f}_{lon:.4f}_{radius_m:.0f}"
+
+
+async def _watch_live_job(job: _LiveJob):
+    """
+    Async generator that replays buffered messages then streams new ones.
+    Polls the job state every 300 ms; sends a heartbeat every 5 s of silence.
+    """
+    idx            = 0
+    last_heartbeat = asyncio.get_event_loop().time()
+
+    while True:
+        with job._lock:
+            batch    = list(job.messages[idx:])
+            idx     += len(batch)
+            done     = job.done
+            is_error = job.is_error
+            result   = job.result
+
+        for msg in batch:
+            yield f"data: {_json.dumps({'progress': msg})}\n\n"
+
+        if done:
+            if is_error:
+                yield f"data: {_json.dumps({'status': 'error', 'message': result})}\n\n"
+            else:
+                yield f"data: {_json.dumps({'status': 'completed', 'summary': result})}\n\n"
+            break
+
+        now = asyncio.get_event_loop().time()
+        if not batch and now - last_heartbeat >= 5:
+            yield f"data: {_json.dumps({'heartbeat': True})}\n\n"
+            last_heartbeat = now
+
+        await asyncio.sleep(0.3)
 
 
 async def run_in_executor(func, *args, **kwargs):
@@ -857,9 +950,10 @@ async def precompute_area_endpoint(request: PrecomputeRequest):
     """
     Precompute garden classification for a large area.
 
-    Returns a stream of Server-Sent Events with progress updates,
-    keeping the ALB connection alive during long-running jobs.
-    The final event contains the full result.
+    Returns a stream of Server-Sent Events with progress updates.
+    If the same area is already being computed (e.g. after a page refresh),
+    the new connection replays all buffered messages and then streams the rest
+    — no duplicate work, no data loss.
     """
     tile_source = get_tile_source(request.tile_source)
     manager = PrecomputeManager(tile_source=tile_source)
@@ -869,12 +963,31 @@ async def precompute_area_endpoint(request: PrecomputeRequest):
             yield f"data: {_json.dumps({'status': 'completed', 'message': 'Already cached', 'summary': {'from_cache': True}})}\n\n"
         return StreamingResponse(_cached(), media_type="text/event-stream")
 
-    progress_queue: queue.Queue = queue.Queue()
+    job_key = _live_job_key(request.lat, request.lon, request.radius_m)
+
+    # Purge stale completed jobs (> 10 min old)
+    _now = time.time()
+    for k in list(_live_jobs.keys()):
+        j = _live_jobs[k]
+        if j.done and _now - j.started_at > 600:
+            _live_jobs.pop(k, None)
+
+    # Reconnect to an already-running job (page refresh mid-precompute)
+    existing = _live_jobs.get(job_key)
+    if existing and not existing.done:
+        async def _reconnect():
+            yield f"data: {_json.dumps({'job_key': job_key, 'reconnected': True, 'elapsed_s': round(time.time() - existing.started_at, 1)})}\n\n"
+            async for event in _watch_live_job(existing):
+                yield event
+        return StreamingResponse(_reconnect(), media_type="text/event-stream")
+
+    # New job — register and start
+    job = _LiveJob(job_key, request.lat, request.lon, request.radius_m,
+                   request.tile_source or "auto")
+    _live_jobs[job_key] = job
 
     def _progress_cb(msg: str):
-        progress_queue.put(msg)
-
-    _sentinel = object()
+        job.push(msg)
 
     def _run():
         try:
@@ -883,40 +996,29 @@ async def precompute_area_endpoint(request: PrecomputeRequest):
                 parallel=True, show_progress=True,
                 progress_callback=_progress_cb,
             )
-            progress_queue.put(("__result__", summary))
+            job.finish(summary)
         except Exception as e:
-            progress_queue.put(("__error__", str(e)))
+            job.fail(str(e))
         finally:
-            progress_queue.put(_sentinel)
             gc.collect()
 
     async def _stream():
         async with _precompute_semaphore:
             loop = asyncio.get_event_loop()
             loop.run_in_executor(_executor, _run)
-
-            while True:
-                try:
-                    item = await asyncio.wait_for(
-                        loop.run_in_executor(None, progress_queue.get, True, 30),
-                        timeout=35,
-                    )
-                except (asyncio.TimeoutError, Exception):
-                    yield f"data: {_json.dumps({'heartbeat': True})}\n\n"
-                    continue
-
-                if item is _sentinel:
-                    break
-                if isinstance(item, tuple) and len(item) == 2:
-                    tag, payload = item
-                    if tag == "__result__":
-                        yield f"data: {_json.dumps({'status': 'completed', 'summary': payload})}\n\n"
-                    elif tag == "__error__":
-                        yield f"data: {_json.dumps({'status': 'error', 'message': payload})}\n\n"
-                else:
-                    yield f"data: {_json.dumps({'progress': str(item)})}\n\n"
+            # Send job key first so the client can persist it for resume
+            yield f"data: {_json.dumps({'job_key': job_key, 'started': True})}\n\n"
+            async for event in _watch_live_job(job):
+                yield event
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/precompute/active")
+async def get_active_precomputes():
+    """Return metadata for all currently running precompute jobs."""
+    active = [j.to_meta() for j in _live_jobs.values() if not j.done]
+    return {"active_jobs": active}
 
 
 @app.get("/api/cache/stats", response_model=CacheStatsResponse)
