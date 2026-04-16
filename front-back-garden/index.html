@@ -438,13 +438,14 @@ body {
 .loading-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(10,15,26,0.85);
+  background: rgba(10,15,26,0.88);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   z-index: 2000;
   display: none;
+  padding: 24px;
 }
 
 .loading-overlay.active { display: flex; }
@@ -456,6 +457,7 @@ body {
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
 }
 
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -465,7 +467,137 @@ body {
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--text-dim);
+  text-align: center;
 }
+
+.loading-progress {
+  margin-top: 16px;
+  width: 100%;
+  max-width: 520px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  max-height: 160px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  display: none;
+}
+
+.loading-progress.visible { display: block; }
+.loading-progress .prog-line { padding: 1px 0; line-height: 1.5; }
+.loading-progress .prog-line.step { color: var(--accent); font-weight: 600; }
+.loading-progress .prog-line.sub { color: var(--text-dim); padding-left: 8px; }
+
+.cache-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  margin-top: 6px;
+}
+
+.cache-badge.cached   { background: #14532d33; color: var(--accent); border: 1px solid #166534; }
+.cache-badge.uncached { background: #1e3a5f33; color: var(--accent-back); border: 1px solid #1e40af; }
+
+/* Resume banner */
+.resume-banner {
+  display: none;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  background: linear-gradient(90deg, #0f2a1a, #0a1a30);
+  border-bottom: 1px solid var(--accent);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  flex-wrap: wrap;
+}
+
+.resume-banner.visible { display: flex; }
+
+.resume-banner-icon { font-size: 16px; animation: spin 2s linear infinite; display: inline-block; }
+.resume-banner-text { color: var(--text); flex: 1; min-width: 200px; }
+.resume-banner-text strong { color: var(--accent); }
+
+.btn-resume {
+  padding: 5px 14px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-resume:hover { background: var(--accent); color: #000; }
+
+.btn-dismiss-banner {
+  padding: 5px 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-dismiss-banner:hover { color: var(--text); border-color: var(--text-dim); }
+
+/* Progress bar */
+.progress-bar-wrap {
+  margin-top: 16px;
+  width: 100%;
+  max-width: 520px;
+  display: none;
+}
+.progress-bar-wrap.visible { display: block; }
+
+.progress-steps-row {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.progress-step-dot {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  transition: background 0.4s;
+  position: relative;
+}
+.progress-step-dot.active { background: var(--accent); }
+.progress-step-dot.done   { background: #166534; }
+
+.progress-step-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  margin-top: 6px;
+}
+
+.progress-meta .step-name { color: var(--accent); font-weight: 600; }
+.progress-meta .eta { color: var(--orange); }
 
 .pipeline-section {
   padding: 40px;
@@ -804,6 +936,14 @@ footer a:hover { text-decoration: underline; }
   <button class="btn-check" onclick="checkHealth()">Check</button>
 </div>
 
+<!-- Resume banner: shown when a precompute is in progress after page refresh -->
+<div class="resume-banner" id="resumeBanner">
+  <span class="resume-banner-icon">⟳</span>
+  <span class="resume-banner-text" id="resumeBannerText">Precompute in progress…</span>
+  <button class="btn-resume" id="resumeBannerBtn" onclick="resumeActiveJob()">Watch Progress</button>
+  <button class="btn-dismiss-banner" onclick="dismissResumeBanner()">Dismiss</button>
+</div>
+
 <div class="main">
   <div class="sidebar">
     <div class="sidebar-tab">
@@ -877,10 +1017,11 @@ footer a:hover { text-decoration: underline; }
         <input type="checkbox" id="batchGenMap" />
         <label for="batchGenMap">Generate visualization map</label>
       </div>
+      <div id="cacheStatusBadge" style="display:none;"></div>
       <button class="btn btn-blue" id="btnBatch" onclick="getBatchPins()">Get All Pins in Radius</button>
       <hr class="separator" />
-      <div class="hint">For large areas, precompute first for speed:</div>
-      <button class="btn btn-orange" id="btnPrecompute" onclick="precomputeArea()">Precompute Area</button>
+      <div class="hint">Precompute runs the full pipeline and caches results. If already cached, pins load instantly.</div>
+      <button class="btn btn-orange" id="btnPrecompute" onclick="precomputeArea()">Precompute / Load if Cached</button>
     </div>
 
     <!-- Classify Panel -->
@@ -920,6 +1061,17 @@ footer a:hover { text-decoration: underline; }
     <div class="loading-overlay" id="loadingOverlay">
       <div class="spinner"></div>
       <div class="loading-text" id="loadingText">Processing...</div>
+
+      <!-- Step progress bar (shown during precompute) -->
+      <div class="progress-bar-wrap" id="progressBarWrap">
+        <div class="progress-steps-row" id="progressStepDots"></div>
+        <div class="progress-meta">
+          <span class="step-name" id="progressStepName"></span>
+          <span class="eta" id="progressEta"></span>
+        </div>
+      </div>
+
+      <div class="loading-progress" id="loadingProgress"></div>
     </div>
     <div class="results-drawer" id="resultsDrawer">
       <div class="results-header">
@@ -1076,13 +1228,158 @@ function buildUrl(path) {
   return path.replace(/^\//, '');
 }
 
-function showLoading(text) {
+// ---------------------------------------------------------------------------
+// Pipeline step definitions (for progress bar)
+// Used for both 5-step (single-pass) and 3-step (chunked) modes.
+// ---------------------------------------------------------------------------
+const PIPELINE_4 = [
+  { label: '1 · Fetch',    name: 'Fetching imagery + OSM' },
+  { label: '2 · Veg',     name: 'Detecting vegetation' },
+  { label: '3 · Classify',name: 'Classifying front/back' },
+  { label: '4 · Pins',    name: 'Placing delivery pins' },
+];
+const PIPELINE_3 = [
+  { label: '1 · Fetch',   name: 'Fetching imagery + OSM' },
+  { label: '2 · Chunks',  name: 'Processing chunks' },
+  { label: '3 · Post',    name: 'Post-processing' },
+];
+
+// Progress bar state
+let _pbSteps       = PIPELINE_4;
+let _pbCurrent     = -1;   // index into _pbSteps
+let _pbStartMs     = 0;    // wall-clock ms when precompute started
+let _pbStepStartMs = 0;    // when current step started
+let _pbTickTimer   = null; // interval for live elapsed tick
+
+function _initProgressBar(steps) {
+  _pbSteps    = steps;
+  _pbCurrent  = -1;
+  _pbStartMs  = Date.now();
+  _pbStepStartMs = Date.now();
+
+  const dotsEl = document.getElementById('progressStepDots');
+  dotsEl.innerHTML = '';
+  steps.forEach((s, i) => {
+    const dot = document.createElement('div');
+    dot.className = 'progress-step-dot';
+    dot.id = `pbDot${i}`;
+    dot.title = s.name;
+    dotsEl.appendChild(dot);
+  });
+
+  document.getElementById('progressBarWrap').classList.add('visible');
+  document.getElementById('progressStepName').textContent = '';
+  document.getElementById('progressEta').textContent = '';
+
+  // Live elapsed ticker so the UI never looks frozen mid-step
+  if (_pbTickTimer) clearInterval(_pbTickTimer);
+  _pbTickTimer = setInterval(() => {
+    if (_pbCurrent < 0) return;
+    const etaEl = document.getElementById('progressEta');
+    if (!etaEl || etaEl.dataset.finalised === '1') return;
+    const stepSec  = ((Date.now() - _pbStepStartMs) / 1000).toFixed(0);
+    const totalSec = ((Date.now() - _pbStartMs)     / 1000).toFixed(0);
+    // Estimate remaining time from progress fraction
+    const frac = (_pbCurrent + 0.5) / _pbSteps.length;
+    const elapsed = (Date.now() - _pbStartMs) / 1000;
+    const etaPart = (frac > 0.05 && elapsed > 2)
+      ? ` · ~${Math.max(0, Math.round(elapsed / frac * (1 - frac)))}s remaining`
+      : '';
+    etaEl.textContent = `step ${stepSec}s · total ${totalSec}s${etaPart}`;
+  }, 1000);
+}
+
+function _advanceStep(idx) {
+  if (idx === _pbCurrent) return;
+  const now = Date.now();
+  _pbStepStartMs = now;
+  _pbCurrent = idx;
+
+  _pbSteps.forEach((_, i) => {
+    const dot = document.getElementById(`pbDot${i}`);
+    if (!dot) return;
+    dot.className = 'progress-step-dot' + (i < idx ? ' done' : i === idx ? ' active' : '');
+  });
+
+  const step = _pbSteps[idx];
+  if (step) document.getElementById('progressStepName').textContent = step.name;
+
+  // Reset elapsed ticker for this new step
+  const etaEl = document.getElementById('progressEta');
+  if (etaEl) {
+    delete etaEl.dataset.finalised;
+    etaEl.textContent = `step 0s · total 0s`;
+  }
+}
+
+function _finishProgressBar() {
+  if (_pbTickTimer) { clearInterval(_pbTickTimer); _pbTickTimer = null; }
+  _pbSteps.forEach((_, i) => {
+    const dot = document.getElementById(`pbDot${i}`);
+    if (dot) dot.className = 'progress-step-dot done';
+  });
+  document.getElementById('progressStepName').textContent = 'Complete';
+  const etaEl = document.getElementById('progressEta');
+  if (etaEl) {
+    etaEl.dataset.finalised = '1';
+    etaEl.textContent = `${((Date.now() - _pbStartMs) / 1000).toFixed(1)}s total`;
+  }
+}
+
+function _parseStepFromMessage(msg) {
+  // Detect step markers like [1/4], [2/4], [3/4], [4/4] or [1/3], [2/3], [3/3]
+  const m = msg.match(/^\[(\d+)\/(\d+)\]/);
+  if (!m) return;
+  const step  = parseInt(m[1]);
+  const total = parseInt(m[2]);
+
+  if (total === 4) {
+    // Single-pass 4-step pipeline: [1/4]→0, [2/4]→1, [3/4]→2, [4/4]→3
+    if (_pbCurrent === -1) _initProgressBar(PIPELINE_4);
+    _advanceStep(step - 1);
+  } else if (total === 3) {
+    if (_pbCurrent === -1) {
+      // Chunked pipeline — only initialise 3-step if 4-step hasn't started yet
+      _initProgressBar(PIPELINE_3);
+    }
+    if (_pbSteps === PIPELINE_3) _advanceStep(step - 1);
+    // If somehow in 4-step mode, [N/3] is unexpected — ignore
+  }
+}
+
+function showLoading(text, showProgress) {
   document.getElementById('loadingText').textContent = text || 'Processing...';
   document.getElementById('loadingOverlay').classList.add('active');
+  const prog = document.getElementById('loadingProgress');
+  if (showProgress) {
+    prog.classList.add('visible');
+  } else {
+    prog.classList.remove('visible');
+    prog.innerHTML = '';
+    document.getElementById('progressBarWrap').classList.remove('visible');
+  }
+}
+
+function appendProgressLine(msg) {
+  const prog = document.getElementById('loadingProgress');
+  prog.classList.add('visible');
+  const div = document.createElement('div');
+  div.className = 'prog-line ' + (msg.match(/^\[\d/) ? 'step' : 'sub');
+  div.textContent = msg;
+  prog.appendChild(div);
+  prog.scrollTop = prog.scrollHeight;
+  // Drive the progress bar
+  _parseStepFromMessage(msg);
 }
 
 function hideLoading() {
+  if (_pbTickTimer) { clearInterval(_pbTickTimer); _pbTickTimer = null; }
   document.getElementById('loadingOverlay').classList.remove('active');
+  const prog = document.getElementById('loadingProgress');
+  prog.classList.remove('visible');
+  prog.innerHTML = '';
+  document.getElementById('progressBarWrap').classList.remove('visible');
+  _pbCurrent = -1;
 }
 
 function showResults(title, html) {
@@ -1165,6 +1462,7 @@ function renderVisiblePins() {
     const fillColor  = isNoGarden ? '#64748b'
                      : pin.garden_type === 'front' ? '#22c55e' : '#3b82f6';
 
+    const coordStr = `${pin.lat.toFixed(6)}, ${pin.lon.toFixed(6)}`;
     L.circleMarker([pin.lat, pin.lon], {
       renderer:    canvasRenderer,
       radius:      isNoGarden ? 3 : 5,
@@ -1174,9 +1472,12 @@ function renderVisiblePins() {
       opacity:     1,
       fillOpacity: isNoGarden ? 0.35 : 0.85,
     }).bindPopup(
-      `<b>${pin.garden_type || '?'}</b><br>` +
-      `Score: ${Math.round(pin.score || 0)}<br>` +
-      `Surface: ${pin.surface_type || '—'}`
+      `<b style="color:${fillColor}">${pin.garden_type || '?'} garden</b><br>` +
+      `Score: <b>${Math.round(pin.score || 0)}</b><br>` +
+      `Surface: ${pin.surface_type || '—'}<br>` +
+      (pin.distance_to_building_m != null ? `Dist to building: ${pin.distance_to_building_m.toFixed(1)}m<br>` : '') +
+      (pin.building_id ? `Building: <code>${pin.building_id}</code><br>` : '') +
+      `<span style="cursor:pointer;color:#60a5fa;" onclick="navigator.clipboard.writeText('${coordStr}').then(()=>this.textContent='Copied!')">📋 ${coordStr}</span>`
     ).addTo(pinLayer);
 
     rendered++;
@@ -1206,6 +1507,7 @@ map.on('click', function(e) {
   document.getElementById('singleCoords').value   = coords;
   document.getElementById('batchCoords').value    = coords;
   document.getElementById('classifyCoords').value = coords;
+  scheduleCheckCache();
 
   if (clickMarker) map.removeLayer(clickMarker);
   clickMarker = L.circleMarker(e.latlng, {
@@ -1217,6 +1519,10 @@ map.on('click', function(e) {
     fillOpacity: 0.9,
   }).addTo(map);
 });
+
+// Debounced cache check when batch coords or radius change
+document.getElementById('batchCoords').addEventListener('input', scheduleCheckCache);
+document.getElementById('batchRadius').addEventListener('input', scheduleCheckCache);
 
 // Sidebar tabs
 document.querySelectorAll('.sidebar-tab button').forEach(btn => {
@@ -1342,8 +1648,14 @@ async function getBatchPins() {
   const body = { coords, radius_m: radius, tile_source: tileSource, generate_map: genMap, min_score: minScore };
   if (gardenType) body.garden_type = gardenType;
 
-  showLoading(`Scanning ${radius}m radius...`);
   clearPins();
+
+  const startMs = Date.now();
+  let timerInterval = setInterval(() => {
+    const s = ((Date.now() - startMs) / 1000).toFixed(1);
+    showLoading(`Loading ${radius}m radius… ${s}s`);
+  }, 200);
+  showLoading(`Loading ${radius}m radius…`);
 
   try {
     const r = await fetch(buildUrl('/api/garden-pins/batch'), {
@@ -1352,11 +1664,13 @@ async function getBatchPins() {
       body: JSON.stringify(body)
     });
     const d = await r.json();
+    clearInterval(timerInterval);
     hideLoading();
 
     if (!r.ok) { showResults('Error', `<div class="error-msg">${d.detail || JSON.stringify(d)}</div>`); return; }
 
     const [lat, lon] = coords.split(',').map(s => parseFloat(s.trim()));
+    if (radiusCircle) { map.removeLayer(radiusCircle); radiusCircle = null; }
     radiusCircle = L.circle([lat, lon], {
       radius,
       color:       '#22c55e',
@@ -1375,16 +1689,22 @@ async function getBatchPins() {
     const back     = allPins.filter(p => p.garden_type === 'back'  && p.surface_type !== 'no_garden');
     const noGarden = allPins.filter(p => p.surface_type === 'no_garden');
 
-    let html = `<div style="margin-bottom:12px;font-size:13px;">
-      <span style="color:var(--accent);">${front.length} front</span> &middot;
-      <span style="color:var(--accent-back);">${back.length} back</span> &middot;
-      <span style="color:var(--text-dim);">${noGarden.length} no garden</span> &middot;
-      <span>${d.count} total pins</span>
+    const fromCache = d.metadata?.from_cache;
+    const elapsed   = d.metadata?.elapsed_seconds;
+    const wallMs    = ((Date.now() - startMs) / 1000).toFixed(1);
+
+    let html = `<div style="margin-bottom:12px;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span style="color:var(--accent);">● ${front.length} front</span>
+      <span style="color:var(--accent-back);">● ${back.length} back</span>
+      <span style="color:var(--text-dim);">○ ${noGarden.length} no garden</span>
+      <span style="color:var(--text-dim);">${d.count} total</span>
+      ${fromCache ? '<span style="background:#14532d33;color:var(--accent);border:1px solid #166534;padding:2px 8px;border-radius:4px;font-size:11px;">✓ cached</span>' : ''}
+      ${elapsed ? `<span style="color:var(--text-dim);font-size:11px;">${elapsed}s server · ${wallMs}s total</span>` : ''}
     </div>`;
 
     if (d.map_url) {
       const mapSrc = d.map_url.startsWith('http') ? d.map_url : buildUrl(d.map_url);
-      html += `<div style="margin-bottom:12px;"><img src="${mapSrc}" style="width:100%;border-radius:8px;border:1px solid var(--border);" /></div>`;
+      html += `<div style="margin-bottom:12px;"><a href="${mapSrc}" target="_blank" style="color:var(--accent);font-size:13px;">🗺 Open visualization map</a></div>`;
     }
 
     const tableData = allPins.filter(p => p.surface_type !== 'no_garden').slice(0, 100);
@@ -1395,33 +1715,37 @@ async function getBatchPins() {
         html += `<tr><td style="color:${color}">${p.garden_type}</td><td>${p.surface_type}</td><td>${Math.round(p.score || 0)}</td><td>${(p.lat||0).toFixed(6)}</td><td>${(p.lon||0).toFixed(6)}</td></tr>`;
       });
       html += `</tbody></table>`;
-      if (allPins.length > 100) html += `<div class="hint" style="margin-top:8px;">Showing first 100 of ${allPins.length} pins in table</div>`;
+      if (allPins.length > 100) html += `<div class="hint" style="margin-top:8px;">Showing first 100 of ${allPins.length} pins in table. All ${allPins.length} rendered on map.</div>`;
     }
 
-    html += `<details style="margin-top:12px;"><summary style="cursor:pointer;color:var(--text-dim);font-size:12px;">Raw JSON (${d.count} pins)</summary><div class="json-pre">${syntaxHighlight(d)}</div></details>`;
+    // Omit the full pins array from the raw JSON view — it's already rendered on
+    // the map and syntax-highlighting thousands of pins crashes the browser tab.
+    const dSummary = Object.fromEntries(Object.entries(d).filter(([k]) => k !== 'pins'));
+    html += `<details style="margin-top:12px;"><summary style="cursor:pointer;color:var(--text-dim);font-size:12px;">Raw JSON (metadata only — pins on map)</summary><div class="json-pre">${syntaxHighlight(dSummary)}</div></details>`;
 
-    const elapsed = d.metadata?.elapsed_seconds;
-    const cached  = d.metadata?.from_cache ? ' (cached)' : '';
-    showResults(`Batch Results — ${d.count} pins${cached}${elapsed ? ` in ${elapsed}s` : ''}`, html);
+    showResults(`${d.count} pins in ${radius}m radius${fromCache ? ' (cached)' : ''}`, html);
+    updateCacheBadge(true);
 
   } catch (e) {
+    clearInterval(timerInterval);
     hideLoading();
     showResults('Error', `<div class="error-msg">${e.message}\n${e.stack}</div>`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Precompute
+// Precompute — streams SSE progress, then auto-loads pins on completion.
+// Saves job_key to localStorage so a page refresh can offer to resume.
 // ---------------------------------------------------------------------------
-async function precomputeArea() {
-  const coords = document.getElementById('batchCoords').value.trim();
-  if (!coords) { alert('Enter center coordinates'); return; }
-
-  const radius     = parseInt(document.getElementById('batchRadius').value) || 200;
-  const tileSource = document.getElementById('batchTileSource').value;
-  const [lat, lon] = coords.split(',').map(s => parseFloat(s.trim()));
-
-  showLoading(`Precomputing ${radius}m radius — this may take 1-3 minutes...`);
+async function _runPrecomputeStream(lat, lon, radius, tileSource, isResume) {
+  const verb = isResume ? 'Resuming' : 'Precomputing';
+  showLoading(`${verb} ${radius}m radius…`, true);
+  if (!isResume) {
+    appendProgressLine(`Starting precompute for ${radius}m at ${lat.toFixed(5)}, ${lon.toFixed(5)}…`);
+    _initProgressBar(PIPELINE_4); // initialise now; will switch to PIPELINE_3 if needed
+  } else {
+    appendProgressLine(`Reconnecting to in-progress precompute…`);
+  }
 
   try {
     const r = await fetch(buildUrl('/api/precompute'), {
@@ -1429,18 +1753,214 @@ async function precomputeArea() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ lat, lon, radius_m: radius, tile_source: tileSource })
     });
-    const d = await r.json();
-    hideLoading();
 
-    let html = `<div style="margin-bottom:12px;font-size:14px;color:var(--accent);">${d.status === 'completed' ? 'Precomputation complete' : d.status}</div>`;
-    html += `<p style="font-size:13px;color:var(--text-dim);margin-bottom:12px;">${d.message}</p>`;
-    if (d.summary) html += `<div class="json-pre">${syntaxHighlight(d.summary)}</div>`;
-    showResults('Precompute Result', html);
+    const reader  = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer    = '';
+    let lastEvent = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.heartbeat) continue;
+          lastEvent = data;
+
+          if (data.job_key) {
+            // Persist so page refresh can offer resume
+            localStorage.setItem('manna_precompute_job', JSON.stringify({
+              job_key: data.job_key, lat, lon, radius_m: radius,
+              tile_source: tileSource, started_at: Date.now(),
+            }));
+            if (data.reconnected) {
+              appendProgressLine(`↩ Reconnected — replaying ${data.elapsed_s}s of buffered progress…`);
+            }
+          }
+
+          if (data.progress) {
+            appendProgressLine(data.progress);
+            if (data.progress.match(/^\[\d/)) showLoading(data.progress.split('\n')[0], true);
+          } else if (data.status === 'completed') {
+            _finishProgressBar();
+            appendProgressLine(data.summary?.from_cache ? '✓ Already cached' : '✓ Complete');
+          } else if (data.status === 'error') {
+            appendProgressLine(`✗ Error: ${data.message}`);
+          } else if (data.message) {
+            appendProgressLine(data.message);
+          }
+        } catch (_) {}
+      }
+    }
+
+    hideLoading();
+    dismissResumeBanner();
+    localStorage.removeItem('manna_precompute_job');
+
+    const d = lastEvent || {};
+    if (d.status === 'completed' || d.summary?.from_cache) {
+      await getBatchPins();
+    } else {
+      let html = `<div style="margin-bottom:12px;font-size:14px;color:var(--danger);">Did not complete: ${d.status || 'unknown'}</div>`;
+      if (d.message) html += `<p style="font-size:13px;color:var(--text-dim);">${d.message}</p>`;
+      showResults('Precompute Result', html);
+    }
 
   } catch (e) {
     hideLoading();
-    showResults('Error', `<div class="error-msg">${e.message}\n${e.stack}</div>`);
+    showResults('Error', `<div class="error-msg">${e.message}</div>`);
   }
+}
+
+async function precomputeArea() {
+  const coords = document.getElementById('batchCoords').value.trim();
+  if (!coords) { alert('Enter center coordinates'); return; }
+  const radius     = parseInt(document.getElementById('batchRadius').value) || 200;
+  const tileSource = document.getElementById('batchTileSource').value;
+  const [lat, lon] = coords.split(',').map(s => parseFloat(s.trim()));
+  await _runPrecomputeStream(lat, lon, radius, tileSource, false);
+}
+
+// ---------------------------------------------------------------------------
+// Resume banner — on page load, check server + localStorage for active jobs
+// ---------------------------------------------------------------------------
+let _activeResumeJob = null;
+
+async function checkForActiveJobs() {
+  try {
+    const r = await fetch(buildUrl('/api/precompute/active'));
+    const d = await r.json();
+    const jobs = d.active_jobs || [];
+
+    if (jobs.length > 0) {
+      _activeResumeJob = jobs[0];
+      showResumeBanner(_activeResumeJob);
+      return;
+    }
+
+    // No server-side job — check localStorage for a recently started one
+    const saved = localStorage.getItem('manna_precompute_job');
+    if (saved) {
+      try {
+        const j = JSON.parse(saved);
+        // Only surface if started within last 30 min
+        if (Date.now() - j.started_at < 30 * 60 * 1000) {
+          _activeResumeJob = j;
+          showResumeBanner(j, true); // stale = may have finished while offline
+        } else {
+          localStorage.removeItem('manna_precompute_job');
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+function showResumeBanner(job, stale) {
+  const banner = document.getElementById('resumeBanner');
+  const text   = document.getElementById('resumeBannerText');
+  const btn    = document.getElementById('resumeBannerBtn');
+  const r      = job.radius_m || job.radius;
+  const elapsed = job.elapsed_s ? ` · ${job.elapsed_s}s elapsed` : '';
+  text.innerHTML = stale
+    ? `A precompute was started for <strong>${job.lat?.toFixed(4)}, ${job.lon?.toFixed(4)} · ${r}m</strong> — it may still be running.`
+    : `Precompute in progress: <strong>${job.lat?.toFixed(4)}, ${job.lon?.toFixed(4)} · ${r}m</strong>${elapsed}`;
+  btn.textContent = stale ? 'Check & Resume' : 'Watch Progress';
+  banner.classList.add('visible');
+
+  // Pre-fill the batch panel coords/radius for convenience
+  if (job.lat && job.lon) {
+    document.getElementById('batchCoords').value = `${job.lat.toFixed(6)}, ${job.lon.toFixed(6)}`;
+    document.getElementById('batchRadius').value  = r;
+    // Switch to batch tab
+    document.querySelectorAll('.sidebar-tab button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelector('[data-panel="batch"]').classList.add('active');
+    document.getElementById('panel-batch').classList.add('active');
+  }
+}
+
+async function resumeActiveJob() {
+  if (!_activeResumeJob) return;
+  const j = _activeResumeJob;
+  const lat      = j.lat;
+  const lon      = j.lon;
+  const radius   = j.radius_m || j.radius;
+  const tileSrc  = j.tile_source || 'auto';
+  document.getElementById('batchCoords').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+  document.getElementById('batchRadius').value  = radius;
+  await _runPrecomputeStream(lat, lon, radius, tileSrc, true);
+}
+
+function dismissResumeBanner() {
+  document.getElementById('resumeBanner').classList.remove('visible');
+  _activeResumeJob = null;
+}
+
+// ---------------------------------------------------------------------------
+// Cache status badge — debounced check on coords/radius change
+// ---------------------------------------------------------------------------
+let _cacheCheckTimer = null;
+
+function scheduleCheckCache() {
+  clearTimeout(_cacheCheckTimer);
+  _cacheCheckTimer = setTimeout(checkCacheStatus, 600);
+}
+
+async function checkCacheStatus() {
+  const coords = document.getElementById('batchCoords').value.trim();
+  const radius = parseInt(document.getElementById('batchRadius').value) || 200;
+  const badge  = document.getElementById('cacheStatusBadge');
+  if (!coords) { badge.style.display = 'none'; return; }
+
+  const [lat, lon] = coords.split(',').map(s => parseFloat(s.trim()));
+  if (isNaN(lat) || isNaN(lon)) { badge.style.display = 'none'; return; }
+
+  try {
+    // Fire precompute with a read that returns immediately if cached;
+    // abort after 2s so we don't accidentally trigger a long precompute.
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 2000);
+
+    const r = await fetch(buildUrl('/api/precompute'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ lat, lon, radius_m: radius }),
+      signal:  ctrl.signal,
+    });
+    clearTimeout(timeout);
+
+    // Read first SSE chunk only
+    const reader  = r.body.getReader();
+    const decoder = new TextDecoder();
+    const { value } = await reader.read();
+    reader.cancel();
+
+    const text = decoder.decode(value || new Uint8Array());
+    const cached = text.includes('"from_cache": true') || text.includes('"from_cache":true');
+
+    badge.style.display = 'block';
+    badge.innerHTML = cached
+      ? `<span class="cache-badge cached">✓ Cached — pins ready</span>`
+      : `<span class="cache-badge uncached">○ Not cached — precompute needed</span>`;
+  } catch (_) {
+    // Abort or network error — don't show badge
+    badge.style.display = 'none';
+  }
+}
+
+function updateCacheBadge(cached) {
+  const badge = document.getElementById('cacheStatusBadge');
+  badge.style.display = 'block';
+  badge.innerHTML = cached
+    ? `<span class="cache-badge cached">✓ Cached — pins ready</span>`
+    : `<span class="cache-badge uncached">○ Not cached — precompute needed</span>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,6 +2043,7 @@ async function clearCache() {
 }
 
 checkHealth();
+checkForActiveJobs();
 </script>
 </body>
 </html>

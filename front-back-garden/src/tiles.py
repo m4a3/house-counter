@@ -602,7 +602,7 @@ def fetch_area_image(
     if safe != zoom:
         if show_progress:
             print(f"⚠️  Zoom auto-reduced {zoom} → {safe} "
-                  f"(image at zoom {zoom} would exceed ~{MAX_IMAGE_PIXELS_SIDE}px limit)")
+                  f"(image at zoom {zoom} would exceed ~{MAX_IMAGE_PIXELS_SIDE}px limit)", flush=True)
         zoom = safe
 
     if tile_source is None:
@@ -612,7 +612,7 @@ def fetch_area_image(
     if use_cache:
         cached_image, cached_metadata = load_from_cache(center_lat, center_lon, radius_m, zoom)
         if cached_image is not None:
-            print(f"📦 Loaded from cache (zoom {zoom}, {cached_metadata['image_size'][0]}x{cached_metadata['image_size'][1]} pixels)")
+            print(f"📦 Loaded from cache (zoom {zoom}, {cached_metadata['image_size'][0]}x{cached_metadata['image_size'][1]} pixels)", flush=True)
             return cached_image, cached_metadata
     
     # Get tiles needed
@@ -628,23 +628,23 @@ def fetch_area_image(
         # Try Manna first
         if check_manna_tile_availability(center_lat, center_lon, zoom):
             use_manna = True
-            print(f"Using Manna tiles (better coverage for this area)")
+            print(f"Using Manna tiles (better coverage for this area)", flush=True)
         elif config.GOOGLE_TILES_API_KEY:
             use_google = True
-            print(f"Using Google tiles (Manna not available)")
+            print(f"Using Google tiles (Manna not available)", flush=True)
         else:
-            print("No tile source available - using placeholder")
+            print("No tile source available - using placeholder", flush=True)
             return create_placeholder_image(center_lat, center_lon, radius_m, zoom)
     elif tile_source == TileSource.MANNA:
         if get_manna_tile_url():
             use_manna = True
         else:
-            print("Manna tiles not configured - falling back to Google")
+            print("Manna tiles not configured - falling back to Google", flush=True)
             use_google = True
     else:  # TileSource.GOOGLE
         use_google = True
     
-    print(f"Fetching {len(tiles)} tiles at zoom {zoom}...")
+    print(f"Fetching {len(tiles)} tiles at zoom {zoom}...", flush=True)
 
     # Create session token for Google if needed
     session_token = None
@@ -707,7 +707,7 @@ def fetch_area_image(
 
     if show_progress:
         from tqdm import tqdm as _tqdm
-        pbar = _tqdm(total=len(tiles), desc="Fetching tiles")
+        pbar = _tqdm(total=len(tiles), desc="Fetching tiles", dynamic_ncols=True, file=__import__("sys").stdout)
     else:
         pbar = None
 
@@ -734,13 +734,13 @@ def fetch_area_image(
     
     if failed_tiles:
         if successful_tiles == 0:
-            print(f"❌ All {len(tiles)} tiles failed to fetch")
-            print("   This might be a rate limit or API issue.")
+            print(f"❌ All {len(tiles)} tiles failed to fetch", flush=True)
+            print("   This might be a rate limit or API issue.", flush=True)
         else:
-            print(f"Warning: {len(failed_tiles)} tiles failed to fetch")
+            print(f"Warning: {len(failed_tiles)} tiles failed to fetch", flush=True)
     else:
         source_name = "Manna" if use_manna else "Google"
-        print(f"✅ Successfully fetched {successful_tiles} tiles from {source_name}")
+        print(f"✅ Successfully fetched {successful_tiles} tiles from {source_name}", flush=True)
     
     # Calculate geographic bounds
     top_lat, left_lon = tile_to_lat_lon(min_x, min_y, zoom)

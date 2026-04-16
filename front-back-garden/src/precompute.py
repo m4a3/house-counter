@@ -35,6 +35,7 @@ import config
 from src.tiles import (
     TileSource,
     fetch_area_image,
+    get_tiles_for_radius,
     recommended_zoom,
 )
 from src.osm import (
@@ -43,6 +44,7 @@ from src.osm import (
     fetch_driveways,
     fetch_address_polygons,
     fetch_property_boundaries,
+    fetch_osm_features,
     geometry_to_pixel_coords,
     load_osm_from_cache,
     project_to_meters,
@@ -178,7 +180,7 @@ class PrecomputeManager:
 
         def _log(msg: str):
             if show_progress:
-                print(msg)
+                print(msg, flush=True)
             if progress_callback is not None:
                 progress_callback(msg)
 
@@ -259,23 +261,67 @@ class PrecomputeManager:
 
         # ---- SINGLE-PASS PIPELINE (radius <= CHUNK_THRESHOLD_M) ----
 
-        # ---- STEPS 1+2: Fetch imagery and OSM data concurrently ----
-        # Both are network-bound and fully independent of each other.
-        _log(f"[1/5] Fetching satellite imagery + OSM data in parallel for {radius_m}m radius...")
+        # ---- STEP 1: Fire ALL network requests simultaneously ----
+        # Tiles, OSM features (buildings/driveways/addresses/barriers) and the
+        # road graph are fully independent — start all 3 at once.
+        _log(f"[1/4] Fetching satellite imagery + OSM data in parallel for {radius_m}m radius...")
         t0 = time.time()
 
-        with ThreadPoolExecutor(max_workers=2) as _pool:
-            _img_future = _pool.submit(
-                fetch_area_image,
-                center_lat, center_lon,
-                radius_m, self.zoom, show_progress, True, self.tile_source,
+        # Check local OSM cache before hitting the network
+        _osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
+
+        # Pre-announce tile count
+        try:
+            _tiles_preview, _ = get_tiles_for_radius(center_lat, center_lon, radius_m, self.zoom)
+            _tile_msg = f"{len(_tiles_preview)} Manna tiles at zoom {self.zoom}"
+        except Exception:
+            _tile_msg = f"tiles at zoom {self.zoom}"
+
+        if _osm_cached is not None:
+            _log(f"    Fetching {_tile_msg} (OSM from cache)...")
+            with ThreadPoolExecutor(max_workers=1) as _pool:
+                _img_future = _pool.submit(
+                    fetch_area_image,
+                    center_lat, center_lon,
+                    radius_m, self.zoom, show_progress, True, self.tile_source,
+                )
+                image, metadata = _img_future.result()
+            buildings          = _osm_cached["buildings"]
+            roads              = _osm_cached["roads"]
+            driveways          = _osm_cached["driveways"]
+            address_polygons   = _osm_cached.get("address_polygons", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+            property_boundaries = _osm_cached.get("property_boundaries", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+            _log(f"    OSM from cache: {len(buildings)} buildings, {len(roads)} roads ({time.time()-t0:.1f}s)")
+        else:
+            _log(f"    Fetching {_tile_msg} + OSM (1 Overpass request for all data) in parallel...")
+            with ThreadPoolExecutor(max_workers=2) as _pool:
+                _img_future  = _pool.submit(
+                    fetch_area_image,
+                    center_lat, center_lon,
+                    radius_m, self.zoom, show_progress, True, self.tile_source,
+                )
+                _osm_future = _pool.submit(fetch_osm_features, center_lat, center_lon, radius_m)
+
+                image, metadata = _img_future.result()
+                osm_features    = _osm_future.result()
+
+            buildings           = osm_features["buildings"]
+            roads               = osm_features["roads"]
+            driveways           = osm_features["driveways"]
+            address_polygons    = osm_features["address_polygons"]
+            property_boundaries = osm_features["property_boundaries"]
+
+            _log(f"    {len(buildings)} buildings, {len(roads)} roads, "
+                 f"{len(driveways)} driveways, {len(address_polygons)} addresses, "
+                 f"{len(property_boundaries)} boundaries ({time.time()-t0:.1f}s)")
+
+            save_osm_to_cache(
+                {
+                    "buildings": buildings, "roads": roads, "driveways": driveways,
+                    "address_polygons": address_polygons, "property_boundaries": property_boundaries,
+                },
+                center_lat, center_lon, radius_m,
             )
-            _osm_future = _pool.submit(
-                self._fetch_osm_data,
-                center_lat, center_lon, radius_m, _log,
-            )
-            image, metadata = _img_future.result()
-            buildings, roads, driveways, address_polygons, property_boundaries = _osm_future.result()
 
         if image is None:
             with PrecomputeManager._active_precomputes_lock:
@@ -286,8 +332,7 @@ class PrecomputeManager:
         geo_bounds = metadata["geo_bounds"]
         image_size = tuple(metadata["image_size"])
 
-        _log(f"    Image: {image_size[0]}x{image_size[1]}, "
-             f"{len(buildings)} buildings ({time.time()-t0:.1f}s)")
+        _log(f"    Image: {image_size[0]}x{image_size[1]} ({time.time()-t0:.1f}s total fetch)")
 
         if buildings.empty:
             with PrecomputeManager._active_precomputes_lock:
@@ -304,8 +349,8 @@ class PrecomputeManager:
                 "from_cache": False,
             }
 
-        # ---- STEP 3: Detect vegetation (ONCE) ----
-        _log("[3/5] Detecting vegetation...")
+        # ---- STEP 2: Detect vegetation (ONCE) ----
+        _log(f"[2/4] Detecting vegetation on {image_size[0]}x{image_size[1]} image...")
         t0 = time.time()
 
         # Two-stage vegetation detection:
@@ -315,15 +360,20 @@ class PrecomputeManager:
         # while still catching shadowed/muted grass that a single HSV range would miss.
         # At lower zoom levels the ExG threshold is relaxed since colors are more muted.
         exg_threshold = 0.05 if self.zoom <= 17 else 0.08
+        _log(f"    [3a] Running HSV vegetation detection...")
         vegetation_mask = detect_vegetation_enhanced(image, use_texture=False)
+        _log(f"    [3a] HSV done ({time.time()-t0:.1f}s)")
 
         # Refine: re-apply ExG at our zoom-aware threshold (the function uses 0.1 internally)
+        _log(f"    [3b] Applying ExG refinement (threshold={exg_threshold})...")
         image_float = image.astype(np.float32) / 255.0
         exg = 2 * image_float[:,:,1] - image_float[:,:,0] - image_float[:,:,2]
         vegetation_mask[exg < exg_threshold] = 0
         del image_float, exg
+        _log(f"    [3b] ExG done ({time.time()-t0:.1f}s)")
 
         # Convert to pixel coords and exclude buildings/roads from vegetation
+        _log(f"    [3c] Converting {len(buildings)} buildings + {len(roads)} roads to pixel coords...")
         building_polys_px = []
         for _, building in buildings.iterrows():
             coords = geometry_to_pixel_coords(building.geometry, geo_bounds, image_size)
@@ -338,16 +388,20 @@ class PrecomputeManager:
 
         vegetation_mask = exclude_buildings_from_mask(vegetation_mask, building_polys_px)
         vegetation_mask = exclude_roads_from_mask(vegetation_mask, road_lines_px, road_width_px=8)
+        _log(f"    [3c] Exclusions done ({time.time()-t0:.1f}s)")
 
         # Texture analysis: split vegetation into grass (smooth) vs tree canopy (rough)
         # Uses CV (std/mean) + building proximity recovery for robustness
+        _log(f"    [3d] Splitting vegetation by texture (grass vs tree canopy)...")
         mpp = (geo_bounds["east"] - geo_bounds["west"]) * 111320 * np.cos(np.radians(center_lat)) / image_size[0]
         grass_mask, tree_mask = split_vegetation_by_texture(
             image, vegetation_mask,
             building_polys_px=building_polys_px,
             meters_per_pixel=mpp
         )
+        _log(f"    [3d] Texture split done ({time.time()-t0:.1f}s)")
 
+        _log(f"    [3e] Recovering shaded grass...")
         grass_mask = recover_shaded_grass(
             image, grass_mask, tree_mask,
             building_polys_px, road_lines_px,
@@ -357,7 +411,7 @@ class PrecomputeManager:
         _log(f"    Vegetation detected ({time.time()-t0:.1f}s)")
 
         # ---- STEP 4: Classify front/back (ONCE) ----
-        _log("[4/5] Classifying front/back gardens...")
+        _log("[3/4] Classifying front/back gardens...")
         t0 = time.time()
 
         classifier = GardenClassifier(
@@ -409,7 +463,7 @@ class PrecomputeManager:
         gc.collect()
 
         # ---- STEP 5: Find pins - ONE per building per garden type ----
-        _log(f"[5/5] Finding delivery pins for {len(buildings)} buildings...")
+        _log(f"[4/4] Finding delivery pins for {len(buildings)} buildings...")
         t0 = time.time()
 
         pin_finder = DeliveryPinFinder(
@@ -1014,70 +1068,6 @@ class PrecomputeManager:
                 })
         return chunks
 
-    def _fetch_osm_data(
-        self, center_lat: float, center_lon: float, radius_m: float,
-        _log: Callable[[str], None],
-    ) -> Tuple:
-        """Fetch all OSM data for an area, returning the five GeoDataFrames."""
-        _log("[1/3] Fetching OSM data for full area...")
-        t0 = time.time()
-
-        osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
-        if osm_cached is not None:
-            buildings = osm_cached["buildings"]
-            roads = osm_cached["roads"]
-            driveways = osm_cached["driveways"]
-            address_polygons = osm_cached.get(
-                "address_polygons",
-                gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"),
-            )
-            property_boundaries = osm_cached.get(
-                "property_boundaries",
-                gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"),
-            )
-            _log(f"    OSM from cache ({len(buildings)} buildings, "
-                 f"{len(roads)} roads) ({time.time()-t0:.1f}s)")
-        else:
-            buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
-            _log(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
-
-            t1 = time.time()
-            roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
-            _log(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
-
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            _empty_gdf = lambda: gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-
-            def _fd():
-                return fetch_driveways(center_lat, center_lon, radius_m, show_progress=False)
-            def _fa():
-                try:
-                    return fetch_address_polygons(center_lat, center_lon, radius_m, show_progress=False)
-                except Exception:
-                    return _empty_gdf()
-            def _fb():
-                try:
-                    return fetch_property_boundaries(center_lat, center_lon, radius_m, show_progress=False)
-                except Exception:
-                    return _empty_gdf()
-
-            t1 = time.time()
-            with _TPE(max_workers=3) as pool:
-                driveways = pool.submit(_fd).result()
-                address_polygons = pool.submit(_fa).result()
-                property_boundaries = pool.submit(_fb).result()
-            _log(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
-                 f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
-
-            save_osm_to_cache({
-                "buildings": buildings,
-                "roads": roads,
-                "driveways": driveways,
-                "address_polygons": address_polygons,
-                "property_boundaries": property_boundaries,
-            }, center_lat, center_lon, radius_m)
-
-        return buildings, roads, driveways, address_polygons, property_boundaries
 
     def _process_chunk_pins(
         self,
@@ -1281,13 +1271,40 @@ class PrecomputeManager:
                 use_cache=True, tile_source=self.tile_source,
             )
 
-        # Fetch OSM for the full area and the full tile image concurrently.
+        # Fire all 3 network requests simultaneously: tiles + OSM features + road graph.
         _log("[1/3] Fetching OSM data + tile image in parallel...")
-        with ThreadPoolExecutor(max_workers=2) as _pool:
-            _osm_fut = _pool.submit(self._fetch_osm_data, center_lat, center_lon, radius_m, _log)
-            _img_fut = _pool.submit(_fetch_full_image)
-            buildings, roads, driveways, address_polygons, property_boundaries = _osm_fut.result()
-            full_image, full_meta = _img_fut.result()
+        _osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
+        if _osm_cached is not None:
+            _log(f"    OSM from cache ({len(_osm_cached['buildings'])} buildings)")
+            with ThreadPoolExecutor(max_workers=1) as _pool:
+                full_image, full_meta = _pool.submit(_fetch_full_image).result()
+            buildings           = _osm_cached["buildings"]
+            roads               = _osm_cached["roads"]
+            driveways           = _osm_cached["driveways"]
+            address_polygons    = _osm_cached.get("address_polygons", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+            property_boundaries = _osm_cached.get("property_boundaries", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+        else:
+            _log("    Fetching tiles + OSM (1 Overpass request for all data) in parallel...")
+            with ThreadPoolExecutor(max_workers=2) as _pool:
+                _img_fut  = _pool.submit(_fetch_full_image)
+                _osm_fut  = _pool.submit(fetch_osm_features, center_lat, center_lon, radius_m)
+                full_image, full_meta = _img_fut.result()
+                osm_features          = _osm_fut.result()
+
+            buildings           = osm_features["buildings"]
+            roads               = osm_features["roads"]
+            driveways           = osm_features["driveways"]
+            address_polygons    = osm_features["address_polygons"]
+            property_boundaries = osm_features["property_boundaries"]
+
+            save_osm_to_cache(
+                {
+                    "buildings": buildings, "roads": roads, "driveways": driveways,
+                    "address_polygons": address_polygons, "property_boundaries": property_boundaries,
+                },
+                center_lat, center_lon, radius_m,
+            )
+            _log(f"    {len(buildings)} buildings, {len(roads)} roads fetched and cached")
 
         if buildings.empty:
             with PrecomputeManager._active_precomputes_lock:

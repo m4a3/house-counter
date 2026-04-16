@@ -22,6 +22,18 @@ env/
 # Service caches and output
 house-counter/building_cache/
 front-back-garden/output/
+output/
+cache/
+
+# Generated reports and combined codebases
+combine_report.txt
+combined_codebase.txt
+
+# Local test/utility scripts
+test_*.py
+run_comparison.py
+compare_imagery.py
+gen_map.py
 
 # Logs
 *.log
