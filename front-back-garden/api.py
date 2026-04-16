@@ -524,6 +524,13 @@ STATIC_DIR = Path(config.OUTPUT_DIR) / "maps"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+_FRONTEND = Path(__file__).parent / "index.html"
+
+@app.get("/", include_in_schema=False)
+async def serve_frontend():
+    """Serve the garden classifier frontend."""
+    return FileResponse(str(_FRONTEND), media_type="text/html")
+
 
 def generate_pins_map(
     pins: List[Dict[str, Any]],
