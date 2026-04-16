@@ -39,11 +39,6 @@ from src.tiles import (
     recommended_zoom,
 )
 from src.osm import (
-    fetch_buildings,
-    fetch_roads,
-    fetch_driveways,
-    fetch_address_polygons,
-    fetch_property_boundaries,
     fetch_osm_features,
     geometry_to_pixel_coords,
     load_osm_from_cache,
@@ -1271,7 +1266,7 @@ class PrecomputeManager:
                 use_cache=True, tile_source=self.tile_source,
             )
 
-        # Fire all 3 network requests simultaneously: tiles + OSM features + road graph.
+        # Fire both network requests simultaneously: tiles + OSM features (single Overpass call).
         _log("[1/3] Fetching OSM data + tile image in parallel...")
         _osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
         if _osm_cached is not None:
