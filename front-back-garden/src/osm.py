@@ -10,6 +10,7 @@ Includes caching support to avoid re-fetching OSM data for the same area.
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 
@@ -17,6 +18,7 @@ import geopandas as gpd
 import numpy as np
 import osmnx as ox
 import pandas as pd
+import requests as _requests
 from shapely.geometry import Point, box, Polygon, MultiPolygon, LineString
 from shapely.ops import unary_union
 import warnings
@@ -31,6 +33,43 @@ ox.settings.use_cache = True
 ox.settings.cache_folder = str(Path(__file__).parent.parent / "output" / "cache" / "osmnx_http")
 ox.settings.log_console = False
 ox.settings.timeout = 60
+
+# Overpass API endpoint used by OSMnx
+_OVERPASS_STATUS_URL = "https://overpass-api.de/api/status"
+# Maximum seconds to wait for a TCP connection before declaring the server unreachable
+_CONNECT_TIMEOUT_S = 5
+
+
+def _probe_server(url: str, label: str, connect_timeout: float = _CONNECT_TIMEOUT_S) -> bool:
+    """
+    Quick TCP connectivity check against an outbound server.
+
+    Logs the attempt and outcome so connection issues are immediately
+    visible in server logs rather than silently blocking a worker.
+    Returns True if the server accepted the connection (any HTTP status),
+    False if the connection was refused or timed out.
+    """
+    print(f"    → Connecting to {label} ({url})...", flush=True)
+    t0 = time.time()
+    try:
+        r = _requests.head(url, timeout=(connect_timeout, 5), allow_redirects=True)
+        elapsed = time.time() - t0
+        print(f"    ✓ {label} reachable — HTTP {r.status_code} in {elapsed:.2f}s", flush=True)
+        return True
+    except _requests.exceptions.ConnectTimeout:
+        elapsed = time.time() - t0
+        print(f"    ✗ {label} connection timeout after {elapsed:.1f}s — failing fast", flush=True)
+        return False
+    except _requests.exceptions.ConnectionError as e:
+        elapsed = time.time() - t0
+        print(f"    ✗ {label} connection error after {elapsed:.1f}s: {e}", flush=True)
+        return False
+    except Exception:
+        # Any other error (e.g. non-2xx HEAD) still means the server is
+        # reachable at the TCP level — let the real request proceed.
+        elapsed = time.time() - t0
+        print(f"    ✓ {label} reachable (probe non-fatal) in {elapsed:.2f}s", flush=True)
+        return True
 
 # Cache directory
 OSM_CACHE_DIR = Path(config.OUTPUT_DIR) / "cache" / "osm"
@@ -627,6 +666,19 @@ def fetch_osm_features(
         "service",  # includes driveways (service + service=driveway)
     ]
 
+    # Probe Overpass before the real query so a dead/unreachable server
+    # fails in _CONNECT_TIMEOUT_S seconds rather than blocking for 60s.
+    if not _probe_server(_OVERPASS_STATUS_URL, label="Overpass API"):
+        print("    Overpass API unreachable — returning empty feature set", flush=True)
+        _empty_ret = lambda: gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        return {
+            "buildings": _empty_ret(), "roads": _empty_ret(),
+            "driveways": _empty_ret(), "address_polygons": _empty_ret(),
+            "property_boundaries": _empty_ret(),
+        }
+
+    print(f"    Querying Overpass API (r={radius_m:.0f}m, timeout={ox.settings.timeout}s)...", flush=True)
+    _t_query = time.time()
     try:
         all_feats = ox.features_from_point(
             (center_lat, center_lon),
@@ -638,7 +690,9 @@ def fetch_osm_features(
             },
             dist=radius_m,
         )
-    except Exception:
+        print(f"    Overpass API returned {len(all_feats)} features in {time.time()-_t_query:.1f}s", flush=True)
+    except Exception as e:
+        print(f"    ✗ Overpass API error after {time.time()-_t_query:.1f}s: {e}", flush=True)
         all_feats = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
     def _col(df, name):

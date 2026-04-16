@@ -236,12 +236,13 @@ def fetch_manna_tile(
     
     try:
         requester = http_session if http_session else requests
-        response = requester.get(url, headers=headers, timeout=10)
+        # (connect_timeout, read_timeout) — fail fast if server is unreachable
+        response = requester.get(url, headers=headers, timeout=(5, 10))
         response.raise_for_status()
-        
+
         img = Image.open(BytesIO(response.content))
         return img.convert("RGB")
-        
+
     except requests.RequestException:
         return None
 
@@ -536,12 +537,13 @@ def fetch_tile(
     
     try:
         requester = http_session if http_session else requests
-        response = requester.get(url, params=params, timeout=10)
+        # (connect_timeout, read_timeout) — fail fast if server is unreachable
+        response = requester.get(url, params=params, timeout=(5, 10))
         response.raise_for_status()
-        
+
         img = Image.open(BytesIO(response.content))
         return img.convert("RGB")
-        
+
     except Exception as e:
         _tile_error_count += 1
         if _tile_error_count <= _TILE_ERROR_LOG_LIMIT:
@@ -644,6 +646,12 @@ def fetch_area_image(
     else:  # TileSource.GOOGLE
         use_google = True
     
+    # Log which tile server we're about to hit so connection issues are
+    # immediately visible in logs rather than appearing as silent hangs.
+    _tile_server_label = "Manna tile server" if use_manna else "Google tile server"
+    _tile_server_url   = (get_manna_tile_url() or "").split("{")[0] if use_manna else "https://tile.googleapis.com"
+    print(f"    → Connecting to {_tile_server_label} ({_tile_server_url})...", flush=True)
+
     print(f"Fetching {len(tiles)} tiles at zoom {zoom}...", flush=True)
 
     # Create session token for Google if needed
