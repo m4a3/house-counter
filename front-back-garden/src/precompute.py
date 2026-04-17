@@ -13,6 +13,7 @@ Previous approach: 4 hours for 500m (25 chunks x separate fetch + process each)
 New approach: ~1-3 minutes for 500m (1 fetch + 1 process + iterate buildings)
 """
 
+import fcntl
 import gc
 import hashlib
 import json
@@ -20,11 +21,29 @@ import os
 import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Callable, List, Tuple, Optional, Dict, Any, Set
 import threading
 import warnings
+
+try:
+    import psutil as _psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _psutil = None
+    _PSUTIL_AVAILABLE = False
+
+
+def _ram_str() -> str:
+    """Return a short RAM usage string, e.g. '2.1 / 7.8 GB (27%)'."""
+    if not _PSUTIL_AVAILABLE:
+        return "psutil not installed"
+    vm = _psutil.virtual_memory()
+    used_gb  = vm.used  / (1024 ** 3)
+    total_gb = vm.total / (1024 ** 3)
+    return f"{used_gb:.1f} / {total_gb:.1f} GB ({vm.percent:.0f}%)"
 
 import numpy as np
 import geopandas as gpd
@@ -42,6 +61,7 @@ from src.osm import (
     fetch_osm_features,
     geometry_to_pixel_coords,
     load_osm_from_cache,
+    load_osm_downscaled,
     project_to_meters,
     save_osm_to_cache,
 )
@@ -58,10 +78,134 @@ CHUNK_SIZE_M = 500
 CHUNK_OVERLAP_M = 100
 
 # Building count above this threshold also triggers chunked processing,
-# regardless of radius. Dense urban areas (e.g. Dublin terraces) can return
-# 2000+ buildings inside a 500m radius, which OOMs the single-pass pipeline
-# on an 8 GB server. 600 buildings is ~2–3 GB peak RAM in single-pass mode.
-BUILDING_CHUNK_THRESHOLD = 600
+# regardless of radius.
+#
+# Memory analysis (500m radius, zoom 19, ~5888×5888 px image):
+#   Peak is driven by IMAGE SIZE, not building count. The two biggest spikes are:
+#   1. distance_transform_edt(return_indices=True) in DeliveryPinFinder:
+#      (2, H, W) int64 = 554 MB + float64 distance = 278 MB → 832 MB spike
+#   2. All persistent float32 distance/density maps: ~4 × 139 MB = 556 MB
+#   Total single-pass peak: ~2 GB for any 500m area regardless of building count.
+#
+# With the cross-process _heavy_phase_lock, only ONE worker does heavy phases
+# at a time. Budget on 8 GB server: 8 - 1 (OS) - 0.5 (idle worker) = 6.5 GB.
+# So single-pass is safe for any area up to ~3000 buildings.
+#
+# The threshold here is a last-resort safety valve for genuinely extreme areas
+# (e.g. airport terminals, stadium surrounds with 5000+ tiny structures).
+# Setting it conservatively at 600 forces chunking on normal dense suburbs,
+# making them ~2× slower with no memory benefit once the lock is in place.
+BUILDING_CHUNK_THRESHOLD = 2500
+
+# ---------------------------------------------------------------------------
+# Cross-process heavy-phase semaphore + RAM admission gate
+# ---------------------------------------------------------------------------
+# Uvicorn runs multiple workers as separate OS processes. A standard
+# threading.Lock() only works within one process. We use an exclusive
+# fcntl file lock on a temp file so that only ONE worker can run the
+# memory-intensive phases (vegetation → classify → pins) at a time.
+#
+# Additionally, even after the lock is acquired we re-check available RAM.
+# If the system is still memory-constrained (previous worker's GC hasn't
+# freed yet), we wait here rather than spike into OOM territory. This gives
+# the server a soft 7 GB ceiling: any work that would exceed it is placed
+# on the back burner and runs when memory is available, rather than crashing.
+#
+# Step 1 (tile + OSM fetch) is I/O-bound and low-memory — it runs freely
+# in both workers concurrently. Steps 2-4 are the memory-intensive work.
+#
+# The lock is *not* held while writing to cache, so the next worker can
+# start as soon as processing completes and large arrays are freed.
+_HEAVY_LOCK_PATH = "/tmp/garden_heavy_precompute.lock"
+
+# How much free RAM we require before and after acquiring the lock.
+# On an 8 GB server: requiring 1.0 GB free ≈ a 7.0 GB effective ceiling.
+# The single-pass pipeline peaks at ~2 GB (image-size-driven, not building-count).
+# OS + idle worker use ~0.5–1 GB, so total at peak is ~3–4 GB — well under 7 GB.
+# The 1.0 GB floor protects against Linux page-cache not reclaiming fast enough
+# during a sudden 832 MB spike (the distance_transform_edt return_indices call).
+# Increase this value to be more conservative; decrease to use more RAM.
+_MIN_FREE_RAM_GB: float = 1.0
+
+# How often to re-check RAM while waiting (seconds).
+_RAM_POLL_INTERVAL_S: float = 5.0
+
+
+def _wait_for_ram_headroom(log_fn: Callable[[str], None] | None = None) -> None:
+    """
+    Block until at least _MIN_FREE_RAM_GB is available on the system.
+
+    This is the "back burner" mechanism: instead of starting a memory-
+    intensive precompute when RAM is constrained, the request waits here.
+    No error is returned; the caller simply resumes when memory is free.
+    """
+    if not _PSUTIL_AVAILABLE:
+        return
+    warned = False
+    while True:
+        vm = _psutil.virtual_memory()
+        available_gb = vm.available / (1024 ** 3)
+        if available_gb >= _MIN_FREE_RAM_GB:
+            if warned and log_fn:
+                log_fn(
+                    f"    [mem-guard] RAM headroom restored "
+                    f"({available_gb:.1f} GB free) — proceeding"
+                )
+            return
+        if not warned:
+            warned = True
+            if log_fn:
+                log_fn(
+                    f"    [mem-guard] Low RAM ({available_gb:.1f} GB free < "
+                    f"{_MIN_FREE_RAM_GB} GB required) — queuing for later, "
+                    f"will retry every {_RAM_POLL_INTERVAL_S:.0f}s ..."
+                )
+        time.sleep(_RAM_POLL_INTERVAL_S)
+
+
+@contextmanager
+def _heavy_phase_lock(log_fn: Callable[[str], None] | None = None):
+    """
+    Exclusive cross-process lock for memory-intensive precompute phases.
+
+    Combines two guards:
+    1. fcntl exclusive file lock — only ONE worker processes at a time.
+    2. RAM admission check — waits until _MIN_FREE_RAM_GB is available,
+       both before and after acquiring the lock.
+
+    The double RAM check matters: the worker that just released the lock
+    may not have had its GC run yet, so RAM could still be high when the
+    next worker acquires. Checking again inside ensures we only start heavy
+    work when memory has actually been freed.
+    """
+    # Guard 1: don't even compete for the lock if RAM is critically low.
+    _wait_for_ram_headroom(log_fn)
+
+    if log_fn:
+        log_fn("    [mem-guard] Waiting for memory slot...")
+    t_wait = time.time()
+    fd = open(_HEAVY_LOCK_PATH, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        # Guard 2: re-check RAM now that we hold the lock. The previous
+        # worker's large arrays may still be in memory if its GC is delayed.
+        _wait_for_ram_headroom(log_fn)
+
+        waited = time.time() - t_wait
+        if log_fn and waited > 0.5:
+            log_fn(
+                f"    [mem-guard] Memory slot acquired after {waited:.1f}s "
+                f"[RAM: {_ram_str()}]"
+            )
+        elif log_fn:
+            log_fn(f"    [mem-guard] Memory slot acquired [RAM: {_ram_str()}]")
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+        if log_fn:
+            log_fn(f"    [mem-guard] Memory slot released [RAM: {_ram_str()}]")
 
 
 @dataclass
@@ -159,6 +303,124 @@ class PrecomputeManager:
         return self.cache_dir / f"chunk_{chunk_key}.pkl"
 
     # ------------------------------------------------------------------
+    # Radius downscale helper
+    # ------------------------------------------------------------------
+
+    def _try_downscale_from_larger_cache(
+        self,
+        center_lat: float,
+        center_lon: float,
+        radius_m: float,
+        save_path: Path,
+        log_fn: Callable[[str], None],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        If a precomputed result exists for the same centre at a LARGER radius,
+        filter its pins to within `radius_m` and return immediately.
+
+        The filtered result is written to `save_path` as a new cache entry so
+        that subsequent identical requests are also instant.
+
+        Returns the result dict (without `elapsed_seconds`) or None if no
+        suitable larger cache was found.
+        """
+        cos_lat = np.cos(np.radians(center_lat))
+        center_pt = Point(center_lon, center_lat)
+
+        # Collect candidate cache entries: same centre, larger radius, same zoom.
+        candidates: list[tuple[float, str]] = []
+        with self._lock:
+            for key, info in self.index.items():
+                if info.get("radius_m", 0) <= radius_m:
+                    continue
+                dlat = info["lat"] - center_lat
+                dlon = info["lon"] - center_lon
+                dist_m = math.sqrt(
+                    (dlat * 111320) ** 2 + (dlon * 111320 * cos_lat) ** 2
+                )
+                if dist_m < 1.0:  # same centre (within 1 m)
+                    candidates.append((info["radius_m"], key))
+
+        if not candidates:
+            return None
+
+        # Use the smallest qualifying larger cache (minimises pins to filter).
+        candidates.sort(key=lambda t: t[0])
+        larger_radius, larger_key = candidates[0]
+        larger_path = self._get_area_cache_path(larger_key)
+
+        try:
+            with open(larger_path, "rb") as f:
+                larger: PrecomputedArea = pickle.load(f)
+        except Exception:
+            return None
+
+        # Convert radius to degrees for quick circle test.
+        radius_lat_deg = radius_m / 111320
+        radius_lon_deg = radius_m / (111320 * cos_lat)
+
+        filtered_pins = []
+        for pin_dict in larger.delivery_pins:
+            dlat = pin_dict["lat"] - center_lat
+            dlon = pin_dict["lon"] - center_lon
+            # Approximate Euclidean distance in metres.
+            dist_m = math.sqrt(
+                (dlat * 111320) ** 2 + (dlon * 111320 * cos_lat) ** 2
+            )
+            if dist_m <= radius_m:
+                filtered_pins.append(pin_dict)
+
+        num_pins = len(filtered_pins)
+        num_front = sum(1 for p in filtered_pins if p.get("garden_type") == "front" and p.get("score", 0) > 0)
+        num_back  = sum(1 for p in filtered_pins if p.get("garden_type") == "back"  and p.get("score", 0) > 0)
+
+        log_fn(
+            f"Radius downscale: filtered {num_pins} pins from "
+            f"{larger_radius:.0f}m cache → {radius_m:.0f}m (no API calls needed)"
+        )
+
+        # Persist the filtered result as its own cache entry.
+        downscaled = PrecomputedArea(
+            center_lat=center_lat,
+            center_lon=center_lon,
+            radius_m=radius_m,
+            zoom=larger.zoom,
+            tile_source=larger.tile_source,
+            computed_at=time.time(),
+            num_buildings=larger.num_buildings,
+            num_front_gardens=num_front,
+            num_back_gardens=num_back,
+            delivery_pins=filtered_pins,
+        )
+        try:
+            with open(save_path, "wb") as f:
+                pickle.dump(downscaled, f)
+            with self._lock:
+                self.index[save_path.stem.replace("area_", "")] = {
+                    "lat": center_lat,
+                    "lon": center_lon,
+                    "radius_m": radius_m,
+                    "computed_at": downscaled.computed_at,
+                    "num_pins": num_pins,
+                    "num_buildings": larger.num_buildings,
+                }
+            self._save_index()
+        except Exception:
+            pass
+
+        return {
+            "center_lat": center_lat,
+            "center_lon": center_lon,
+            "radius_m": radius_m,
+            "total_pins": num_pins,
+            "total_buildings": larger.num_buildings,
+            "num_front": num_front,
+            "num_back": num_back,
+            "tile_source": larger.tile_source,
+            "from_cache": True,
+        }
+
+    # ------------------------------------------------------------------
     # Main precompute - SINGLE PASS
     # ------------------------------------------------------------------
 
@@ -213,6 +475,18 @@ class PrecomputeManager:
                 }
             except Exception:
                 pass
+
+        # Radius downscale: if a precomputed result exists for the SAME center
+        # at a LARGER radius, we can filter its pins to the requested circle
+        # instantly — no tile fetch, no OSM call, no heavy processing.
+        # This makes e.g. a 500m request near-instant after a 1000m precompute.
+        downscaled = self._try_downscale_from_larger_cache(
+            center_lat, center_lon, radius_m, cache_path, _log
+        )
+        if downscaled is not None:
+            elapsed = time.time() - start_time
+            downscaled["elapsed_seconds"] = round(elapsed, 2)
+            return downscaled
 
         # Deduplication: if another thread is already computing this exact area,
         # wait for it to finish then load from cache rather than running a second
@@ -269,6 +543,9 @@ class PrecomputeManager:
         # to the heavier image fetch + processing.
         _osm_pre = load_osm_from_cache(center_lat, center_lon, radius_m)
         if _osm_pre is None:
+            # Try umbrella downscale from a larger cached radius before hitting Overpass.
+            _osm_pre = load_osm_downscaled(center_lat, center_lon, radius_m)
+        if _osm_pre is None:
             _log("    Quick OSM probe to check building density...")
             _osm_pre = fetch_osm_features(center_lat, center_lon, radius_m)
             save_osm_to_cache(
@@ -307,7 +584,11 @@ class PrecomputeManager:
 
         # OSM may already be in hand from the building-count probe above.
         # Fall back to cache or network if not.
-        _osm_cached = _osm_pre if _osm_pre is not None else load_osm_from_cache(center_lat, center_lon, radius_m)
+        _osm_cached = (
+            _osm_pre
+            or load_osm_from_cache(center_lat, center_lon, radius_m)
+            or load_osm_downscaled(center_lat, center_lon, radius_m)
+        )
 
         # Pre-announce tile count
         try:
@@ -388,8 +669,32 @@ class PrecomputeManager:
                 "from_cache": False,
             }
 
+        # ---- STEPS 2-4: Memory-intensive phases ----
+        # Two-stage admission gate (mirrors _heavy_phase_lock):
+        # 1. Wait for RAM headroom before competing for the lock.
+        # 2. Acquire exclusive file lock (only one worker in heavy phases).
+        # 3. Re-check RAM after acquiring (previous worker's GC may not have run).
+        # Step 1 (tile + OSM fetch) already completed above; both workers
+        # can fetch concurrently. Only the CPU/RAM-heavy work is serialised.
+        # The lock is released before the lightweight cache write.
+        _wait_for_ram_headroom(_log)
+        _log("    [mem-guard] Waiting for memory slot...")
+        _heavy_fd = open(_HEAVY_LOCK_PATH, "w")
+        _t_wait = time.time()
+        fcntl.flock(_heavy_fd, fcntl.LOCK_EX)
+        _wait_for_ram_headroom(_log)  # re-check after acquiring
+        _waited = time.time() - _t_wait
+        if _waited > 0.5:
+            _log(f"    [mem-guard] Memory slot acquired after {_waited:.1f}s [RAM: {_ram_str()}]")
+        else:
+            _log(f"    [mem-guard] Memory slot acquired [RAM: {_ram_str()}]")
+        # On an unhandled exception CPython's refcount GC closes _heavy_fd
+        # immediately when it goes out of scope on stack unwind, which releases
+        # the fcntl lock. The kernel also releases all fcntl locks on process death
+        # (e.g. OOM kill), so the second worker is never permanently blocked.
+
         # ---- STEP 2: Detect vegetation (ONCE) ----
-        _log(f"[2/4] Detecting vegetation on {image_size[0]}x{image_size[1]} image...")
+        _log(f"[2/4] Detecting vegetation on {image_size[0]}x{image_size[1]} image... [RAM: {_ram_str()}]")
         t0 = time.time()
 
         # Two-stage vegetation detection:
@@ -450,7 +755,7 @@ class PrecomputeManager:
         _log(f"    Vegetation detected ({time.time()-t0:.1f}s)")
 
         # ---- STEP 4: Classify front/back (ONCE) ----
-        _log("[3/4] Classifying front/back gardens...")
+        _log(f"[3/4] Classifying front/back gardens... [RAM: {_ram_str()}]")
         t0 = time.time()
 
         classifier = GardenClassifier(
@@ -502,7 +807,7 @@ class PrecomputeManager:
         gc.collect()
 
         # ---- STEP 5: Find pins - ONE per building per garden type ----
-        _log(f"[4/4] Finding delivery pins for {len(buildings)} buildings...")
+        _log(f"[4/4] Finding delivery pins for {len(buildings)} buildings... [RAM: {_ram_str()}]")
         t0 = time.time()
 
         pin_finder = DeliveryPinFinder(
@@ -977,6 +1282,13 @@ class PrecomputeManager:
         del buildings, roads, driveways, address_polygons, property_boundaries
         gc.collect()
 
+        # Release the cross-process heavy-phase lock now that all large arrays
+        # have been freed. The cache write below is lightweight (disk I/O only),
+        # so the second worker can start its own heavy phases immediately.
+        fcntl.flock(_heavy_fd, fcntl.LOCK_UN)
+        _heavy_fd.close()
+        _log(f"    [mem-guard] Memory slot released [RAM after GC: {_ram_str()}]")
+
         # ---- Cache results ----
         num_front = sum(1 for p in all_pins if p.garden_type == "front" and p.score > 0)
         num_back = sum(1 for p in all_pins if p.garden_type == "back" and p.score > 0)
@@ -1312,7 +1624,10 @@ class PrecomputeManager:
 
         # Fire both network requests simultaneously: tiles + OSM features (single Overpass call).
         _log("[1/3] Fetching OSM data + tile image in parallel...")
-        _osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
+        _osm_cached = (
+            load_osm_from_cache(center_lat, center_lon, radius_m)
+            or load_osm_downscaled(center_lat, center_lon, radius_m)
+        )
         if _osm_cached is not None:
             _log(f"    OSM from cache ({len(_osm_cached['buildings'])} buildings)")
             with ThreadPoolExecutor(max_workers=1) as _pool:
@@ -1410,7 +1725,7 @@ class PrecomputeManager:
                 except Exception:
                     chunk_cache_path.unlink(missing_ok=True)
 
-            _log(f"    Chunk {ci + 1}/{n_chunks}...")
+            _log(f"    Chunk {ci + 1}/{n_chunks}... [RAM: {_ram_str()}]")
 
             image, metadata = _crop_chunk_image(chunk)
             if image is None:
@@ -1438,11 +1753,16 @@ class PrecomputeManager:
             geo_bounds = metadata["geo_bounds"]
             image_size = tuple(metadata["image_size"])
 
-            chunk_pins = self._process_chunk_pins(
-                image, geo_bounds, image_size,
-                c_buildings, c_roads, c_driveways, c_addr, c_prop,
-                center_lat, center_lon, cb,
-            )
+            # Acquire the cross-process lock for this chunk's heavy phases.
+            # Image data is already cropped (cheap); only vegetation→classify→pins
+            # is memory-intensive. Holding the lock per-chunk (not per-full-precompute)
+            # lets the other worker process its own chunks between ours.
+            with _heavy_phase_lock(_log):
+                chunk_pins = self._process_chunk_pins(
+                    image, geo_bounds, image_size,
+                    c_buildings, c_roads, c_driveways, c_addr, c_prop,
+                    center_lat, center_lon, cb,
+                )
 
             # Persist chunk pins so an interrupted run can resume here.
             try:
