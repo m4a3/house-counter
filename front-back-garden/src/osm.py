@@ -114,6 +114,116 @@ def load_osm_from_cache(center_lat: float, center_lon: float, radius_m: float) -
     return None
 
 
+def load_osm_downscaled(
+    center_lat: float, center_lon: float, radius_m: float
+) -> Optional[Dict[str, gpd.GeoDataFrame]]:
+    """
+    If an OSM cache entry exists for the same centre at a LARGER radius, load
+    it and clip all GeoDataFrames to the requested bounding box.
+
+    This avoids a round-trip to Overpass when the user increases their view
+    from e.g. 500 m → 1000 m (we'd re-use the 1000 m cache for 500 m), or
+    when a pre-existing large-area cache covers the new request.
+
+    Returns the clipped data dict or None if no suitable cache was found.
+    """
+    import math as _math
+    cos_lat = np.cos(np.radians(center_lat))
+
+    # Build bbox for the requested radius.
+    lat_delta = radius_m / 111320
+    lon_delta = radius_m / (111320 * cos_lat)
+    req_bbox = box(
+        center_lon - lon_delta, center_lat - lat_delta,
+        center_lon + lon_delta, center_lat + lat_delta,
+    )
+
+    # Scan cached OSM keys: filename stem is "{hash}_buildings.geojson"
+    # We need to reverse-map hash → (lat, lon, radius). The only way without
+    # a separate index is to try all existing building files and decode their
+    # bounding boxes — instead, we store a lightweight sidecar index.
+    index_path = OSM_CACHE_DIR / "_index.json"
+    if not index_path.exists():
+        return None
+
+    try:
+        with open(index_path) as f:
+            index: dict = json.load(f)
+    except Exception:
+        return None
+
+    candidates: list[tuple[float, str]] = []
+    for cache_key, info in index.items():
+        if info.get("radius_m", 0) <= radius_m:
+            continue
+        dlat = info["lat"] - center_lat
+        dlon = info["lon"] - center_lon
+        dist_m = _math.sqrt(
+            (dlat * 111320) ** 2 + (dlon * 111320 * cos_lat) ** 2
+        )
+        if dist_m < 1.0:
+            candidates.append((info["radius_m"], cache_key))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda t: t[0])
+    _, best_key = candidates[0]
+
+    buildings_path = OSM_CACHE_DIR / f"{best_key}_buildings.geojson"
+    roads_path = OSM_CACHE_DIR / f"{best_key}_roads.geojson"
+    driveways_path = OSM_CACHE_DIR / f"{best_key}_driveways.geojson"
+    exclusions_path = OSM_CACHE_DIR / f"{best_key}_exclusions.geojson"
+    boundaries_path = OSM_CACHE_DIR / f"{best_key}_boundaries.geojson"
+    addresses_path = OSM_CACHE_DIR / f"{best_key}_addresses.geojson"
+
+    if not (buildings_path.exists() and roads_path.exists()):
+        return None
+
+    try:
+        def clip(path: Path) -> gpd.GeoDataFrame:
+            if not path.exists():
+                return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+            gdf = gpd.read_file(path)
+            if gdf.empty:
+                return gdf
+            return gdf[gdf.intersects(req_bbox)].copy()
+
+        result = {
+            "buildings": clip(buildings_path),
+            "roads": clip(roads_path),
+            "driveways": clip(driveways_path),
+            "exclusion_zones": clip(exclusions_path),
+            "property_boundaries": clip(boundaries_path),
+            "address_polygons": clip(addresses_path),
+        }
+        print(
+            f"    OSM umbrella: clipped from {candidates[0][0]:.0f}m cache "
+            f"({len(result['buildings'])} buildings) — no Overpass call needed",
+            flush=True,
+        )
+        return result
+    except Exception:
+        return None
+
+
+def _update_osm_cache_index(
+    cache_key: str, center_lat: float, center_lon: float, radius_m: float
+) -> None:
+    """Maintain a lightweight JSON index so umbrella lookups stay fast."""
+    index_path = OSM_CACHE_DIR / "_index.json"
+    try:
+        index: dict = {}
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+        index[cache_key] = {"lat": center_lat, "lon": center_lon, "radius_m": radius_m}
+        with open(index_path, "w") as f:
+            json.dump(index, f)
+    except Exception:
+        pass
+
+
 def save_osm_to_cache(data: Dict[str, gpd.GeoDataFrame], center_lat: float, center_lon: float, radius_m: float):
     """Save OSM data to cache."""
     OSM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,6 +242,7 @@ def save_osm_to_cache(data: Dict[str, gpd.GeoDataFrame], center_lat: float, cent
         save_gdf(data.get("exclusion_zones"), OSM_CACHE_DIR / f"{cache_key}_exclusions.geojson")
         save_gdf(data.get("property_boundaries"), OSM_CACHE_DIR / f"{cache_key}_boundaries.geojson")
         save_gdf(data.get("address_polygons"), OSM_CACHE_DIR / f"{cache_key}_addresses.geojson")
+        _update_osm_cache_index(cache_key, center_lat, center_lon, radius_m)
     except Exception:
         pass  # Silently fail on cache save errors
 

@@ -31,8 +31,14 @@ import config
 # check is not needed and would block legitimate large-area fetches.
 Image.MAX_IMAGE_PIXELS = None
 
-# Cache directory
+# Cache directory (full stitched images)
 CACHE_DIR = Path(config.OUTPUT_DIR) / "cache"
+
+# Individual tile cache directory — each slippy-map tile is stored separately.
+# Tiles are zoom/x/y tuples that never change, so they can be reused across
+# different radius requests, restarts, and source switches (Manna vs Google
+# both produce RGB tiles at the same coordinates and zoom level).
+_TILE_CACHE_DIR = CACHE_DIR / "tiles"
 
 # Global session token cache (for Google)
 _session_token = None
@@ -188,6 +194,42 @@ def clear_cache():
 
 
 # =============================================================================
+# INDIVIDUAL TILE CACHE
+# =============================================================================
+# Each slippy-map tile (zoom/x/y) is immutable and source-agnostic (both
+# Manna and Google return identical RGB satellite tiles at the same coordinates).
+# Caching tiles individually means:
+#   - A 1000m fetch reuses the inner ~25% of tiles already cached by a 500m fetch
+#   - Any overlapping areas share tiles (adjacent suburbs, different radii)
+#   - Server restarts don't re-fetch tiles fetched in previous runs
+
+def _tile_cache_path(zoom: int, tile_x: int, tile_y: int) -> Path:
+    """Return the path for an individually cached tile PNG."""
+    return _TILE_CACHE_DIR / f"{zoom}" / f"{tile_x}_{tile_y}.png"
+
+
+def _load_tile_from_cache(zoom: int, tile_x: int, tile_y: int) -> Optional[Image.Image]:
+    """Load a single tile from the individual tile cache, or None if not cached."""
+    path = _tile_cache_path(zoom, tile_x, tile_y)
+    if path.exists():
+        try:
+            return Image.open(path).convert("RGB")
+        except Exception:
+            path.unlink(missing_ok=True)
+    return None
+
+
+def _save_tile_to_cache(img: Image.Image, zoom: int, tile_x: int, tile_y: int) -> None:
+    """Save a single tile to the individual tile cache (best-effort, never raises)."""
+    path = _tile_cache_path(zoom, tile_x, tile_y)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(path, format="PNG", optimize=False)
+    except Exception:
+        pass
+
+
+# =============================================================================
 # MANNA TILE SOURCE
 # =============================================================================
 
@@ -224,7 +266,12 @@ def fetch_manna_tile(
     manna_url = get_manna_tile_url()
     if not manna_url:
         return None
-    
+
+    # Individual tile cache check — avoids API call if tile was fetched before.
+    cached = _load_tile_from_cache(zoom, tile_x, tile_y)
+    if cached is not None:
+        return cached
+
     # Build URL - Manna uses standard {z}/{x}/{y} format
     url = manna_url.format(z=zoom, x=tile_x, y=tile_y)
     
@@ -240,8 +287,9 @@ def fetch_manna_tile(
         response = requester.get(url, headers=headers, timeout=(5, 10))
         response.raise_for_status()
 
-        img = Image.open(BytesIO(response.content))
-        return img.convert("RGB")
+        img = Image.open(BytesIO(response.content)).convert("RGB")
+        _save_tile_to_cache(img, zoom, tile_x, tile_y)
+        return img
 
     except requests.RequestException:
         return None
@@ -526,7 +574,13 @@ def fetch_tile(
             "Google Tiles API key not configured!\n"
             "Please add your API key to config.py: GOOGLE_TILES_API_KEY = 'your-key-here'"
         )
-    
+
+    # Individual tile cache check — avoids API call if tile was fetched before.
+    # Tiles are source-agnostic (same slippy-map coordinates = same satellite image).
+    cached = _load_tile_from_cache(zoom, tile_x, tile_y)
+    if cached is not None:
+        return cached
+
     # Map Tiles API endpoint
     url = f"https://tile.googleapis.com/v1/2dtiles/{zoom}/{tile_x}/{tile_y}"
     
@@ -541,8 +595,9 @@ def fetch_tile(
         response = requester.get(url, params=params, timeout=(5, 10))
         response.raise_for_status()
 
-        img = Image.open(BytesIO(response.content))
-        return img.convert("RGB")
+        img = Image.open(BytesIO(response.content)).convert("RGB")
+        _save_tile_to_cache(img, zoom, tile_x, tile_y)
+        return img
 
     except Exception as e:
         _tile_error_count += 1
