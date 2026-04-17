@@ -57,6 +57,12 @@ CHUNK_THRESHOLD_M = 500
 CHUNK_SIZE_M = 500
 CHUNK_OVERLAP_M = 100
 
+# Building count above this threshold also triggers chunked processing,
+# regardless of radius. Dense urban areas (e.g. Dublin terraces) can return
+# 2000+ buildings inside a 500m radius, which OOMs the single-pass pipeline
+# on an 8 GB server. 600 buildings is ~2–3 GB peak RAM in single-pass mode.
+BUILDING_CHUNK_THRESHOLD = 600
+
 
 @dataclass
 class PrecomputedArea:
@@ -254,6 +260,43 @@ class PrecomputeManager:
                 done_event.set()
                 return {"error": str(e), "elapsed_seconds": time.time() - start_time}
 
+        # Building-count guard: dense urban areas (e.g. Dublin terraces) can
+        # return thousands of buildings inside a small radius.  The single-pass
+        # pipeline keeps all masks in memory simultaneously, which OOMs on 8 GB
+        # servers above ~600 buildings.  Delegate to the chunked pipeline which
+        # processes one spatial tile at a time, capping peak RAM per chunk.
+        # We fetch OSM first (cheap) to know the building count before committing
+        # to the heavier image fetch + processing.
+        _osm_pre = load_osm_from_cache(center_lat, center_lon, radius_m)
+        if _osm_pre is None:
+            _log("    Quick OSM probe to check building density...")
+            _osm_pre = fetch_osm_features(center_lat, center_lon, radius_m)
+            save_osm_to_cache(
+                {
+                    "buildings": _osm_pre["buildings"],
+                    "roads": _osm_pre["roads"],
+                    "driveways": _osm_pre["driveways"],
+                    "address_polygons": _osm_pre["address_polygons"],
+                    "property_boundaries": _osm_pre["property_boundaries"],
+                },
+                center_lat, center_lon, radius_m,
+            )
+        _n_buildings = len(_osm_pre["buildings"])
+        if _n_buildings > BUILDING_CHUNK_THRESHOLD:
+            _log(f"    Dense area: {_n_buildings} buildings > {BUILDING_CHUNK_THRESHOLD} threshold "
+                 f"— switching to chunked pipeline to cap peak memory")
+            try:
+                return self._precompute_chunked(
+                    center_lat, center_lon, radius_m,
+                    show_progress, _log, area_key, cache_path,
+                    done_event, start_time,
+                )
+            except Exception as e:
+                with PrecomputeManager._active_precomputes_lock:
+                    PrecomputeManager._active_precomputes.pop(area_key, None)
+                done_event.set()
+                return {"error": str(e), "elapsed_seconds": time.time() - start_time}
+
         # ---- SINGLE-PASS PIPELINE (radius <= CHUNK_THRESHOLD_M) ----
 
         # ---- STEP 1: Fire ALL network requests simultaneously ----
@@ -262,8 +305,9 @@ class PrecomputeManager:
         _log(f"[1/4] Fetching satellite imagery + OSM data in parallel for {radius_m}m radius...")
         t0 = time.time()
 
-        # Check local OSM cache before hitting the network
-        _osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
+        # OSM may already be in hand from the building-count probe above.
+        # Fall back to cache or network if not.
+        _osm_cached = _osm_pre if _osm_pre is not None else load_osm_from_cache(center_lat, center_lon, radius_m)
 
         # Pre-announce tile count
         try:
