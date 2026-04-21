@@ -1437,7 +1437,7 @@ function buildUrl(path) {
 
 // ---------------------------------------------------------------------------
 // Pipeline step definitions (for progress bar)
-// Used for both 5-step (single-pass) and 3-step (chunked) modes.
+// Used for both 4-step (single-pass) and 3-step (chunked) modes.
 // ---------------------------------------------------------------------------
 const PIPELINE_4 = [
   { label: '1 · Fetch',    name: 'Fetching imagery + OSM' },
@@ -1451,18 +1451,77 @@ const PIPELINE_3 = [
   { label: '3 · Post',    name: 'Post-processing' },
 ];
 
+// ---------------------------------------------------------------------------
+// ETA model — empirical timings at 3 concurrent heavy-phase slots, uncached
+// ---------------------------------------------------------------------------
+// Step weights: fraction of total wall-time each step typically takes.
+const STEP_WEIGHTS_4 = [0.07, 0.24, 0.40, 0.29]; // Fetch, Veg, Classify, Pins
+const STEP_WEIGHTS_3 = [0.20, 0.75, 0.05];        // Fetch, Chunks, Post
+
+// [radius_m, seconds] — server measurements, 3 concurrent slots, uncached.
+const _TIMING_SAMPLES = [
+  [  200,  150],
+  [  500,  230],
+  [ 1000,  230],
+  [ 1500,  440],
+  [ 2000,  730],
+  [ 3000, 1600],
+];
+
+function _estimateTotalS(radius_m, nSlots) {
+  nSlots = Math.max(1, nSlots || 3);
+  const s = _TIMING_SAMPLES;
+  let baseS;
+  if (radius_m <= s[0][0]) {
+    baseS = s[0][1];
+  } else if (radius_m >= s[s.length - 1][0]) {
+    const [r1, t1] = s[s.length - 2], [r2, t2] = s[s.length - 1];
+    baseS = t2 * Math.pow(radius_m / r2, Math.log(t2 / t1) / Math.log(r2 / r1));
+  } else {
+    for (let i = 0; i < s.length - 1; i++) {
+      if (radius_m <= s[i + 1][0]) {
+        const [r0, t0] = s[i], [r1, t1] = s[i + 1];
+        baseS = t0 + (t1 - t0) * (radius_m - r0) / (r1 - r0);
+        break;
+      }
+    }
+  }
+  // Chunk step (~75% of chunked pipeline) scales inversely with slot count.
+  // Single-pass (<= ~600m) isn't chunk-bound so no slot adjustment there.
+  if (nSlots !== 3 && radius_m > 600) {
+    const chunkFrac = STEP_WEIGHTS_3[1];
+    baseS = baseS * (1 - chunkFrac) + baseS * chunkFrac * (3 / nSlots);
+  }
+  return Math.round(baseS);
+}
+
+// ---------------------------------------------------------------------------
 // Progress bar state
-let _pbSteps       = PIPELINE_4;
-let _pbCurrent     = -1;   // index into _pbSteps
-let _pbStartMs     = 0;    // wall-clock ms when precompute started
-let _pbStepStartMs = 0;    // when current step started
-let _pbTickTimer   = null; // interval for live elapsed tick
+// ---------------------------------------------------------------------------
+let _pbSteps        = PIPELINE_4;
+let _pbCurrent      = -1;
+let _pbStartMs      = 0;
+let _pbStepStartMs  = 0;
+let _pbTickTimer    = null;
+let _pbTotalEstS    = 0;      // estimated total seconds for this run
+let _pbRadius       = 200;    // radius of the current precompute
+let _pbNSlots       = 3;      // effective concurrent heavy-phase slots
+let _pbChunksTotal  = 0;      // total chunks (chunked pipeline only)
+let _pbChunksDone   = 0;      // completed chunks so far
+
+// Concurrent mid-flight detection
+let _pbPollTimer    = null;
+let _pbJobKey       = null;
+let _pbActiveCount  = 1;
 
 function _initProgressBar(steps) {
-  _pbSteps    = steps;
-  _pbCurrent  = -1;
-  _pbStartMs  = Date.now();
+  _pbSteps       = steps;
+  _pbCurrent     = -1;
+  _pbStartMs     = Date.now();
   _pbStepStartMs = Date.now();
+  _pbChunksTotal = 0;
+  _pbChunksDone  = 0;
+  _pbTotalEstS   = _estimateTotalS(_pbRadius, _pbNSlots);
 
   const dotsEl = document.getElementById('progressStepDots');
   dotsEl.innerHTML = '';
@@ -1478,29 +1537,40 @@ function _initProgressBar(steps) {
   document.getElementById('progressStepName').textContent = '';
   document.getElementById('progressEta').textContent = '';
 
-  // Live elapsed ticker so the UI never looks frozen mid-step
   if (_pbTickTimer) clearInterval(_pbTickTimer);
-  _pbTickTimer = setInterval(() => {
-    if (_pbCurrent < 0) return;
-    const etaEl = document.getElementById('progressEta');
-    if (!etaEl || etaEl.dataset.finalised === '1') return;
-    const stepSec  = ((Date.now() - _pbStepStartMs) / 1000).toFixed(0);
-    const totalSec = ((Date.now() - _pbStartMs)     / 1000).toFixed(0);
-    // Estimate remaining time from progress fraction
-    const frac = (_pbCurrent + 0.5) / _pbSteps.length;
-    const elapsed = (Date.now() - _pbStartMs) / 1000;
-    const etaPart = (frac > 0.05 && elapsed > 2)
-      ? ` · ~${Math.max(0, Math.round(elapsed / frac * (1 - frac)))}s remaining`
-      : '';
-    etaEl.textContent = `step ${stepSec}s · total ${totalSec}s${etaPart}`;
-  }, 1000);
+  _pbTickTimer = setInterval(_pbTick, 1000);
+}
+
+function _pbTick() {
+  if (_pbCurrent < 0) return;
+  const etaEl = document.getElementById('progressEta');
+  if (!etaEl || etaEl.dataset.finalised === '1') return;
+
+  const weights   = _pbSteps === PIPELINE_3 ? STEP_WEIGHTS_3 : STEP_WEIGHTS_4;
+  const stepSec   = Math.round((Date.now() - _pbStepStartMs) / 1000);
+  const totalSec  = Math.round((Date.now() - _pbStartMs) / 1000);
+
+  // Fraction of total work done — use chunk count for step 2 of chunked pipeline.
+  let doneFrac = 0;
+  for (let i = 0; i < _pbCurrent; i++) doneFrac += weights[i];
+  if (_pbSteps === PIPELINE_3 && _pbCurrent === 1 && _pbChunksTotal > 0) {
+    doneFrac += weights[1] * (_pbChunksDone / _pbChunksTotal);
+  } else {
+    const estStepS = weights[_pbCurrent] * _pbTotalEstS;
+    doneFrac += weights[_pbCurrent] * Math.min(0.95, estStepS > 0 ? stepSec / estStepS : 0);
+  }
+
+  const remainS = Math.max(0, Math.round(_pbTotalEstS * (1 - doneFrac)));
+  const etaPart = totalSec > 3
+    ? ` · ~${remainS}s remaining`
+    : '';
+  etaEl.textContent = `step ${stepSec}s · total ${totalSec}s${etaPart}`;
 }
 
 function _advanceStep(idx) {
   if (idx === _pbCurrent) return;
-  const now = Date.now();
-  _pbStepStartMs = now;
-  _pbCurrent = idx;
+  _pbStepStartMs = Date.now();
+  _pbCurrent     = idx;
 
   _pbSteps.forEach((_, i) => {
     const dot = document.getElementById(`pbDot${i}`);
@@ -1511,12 +1581,8 @@ function _advanceStep(idx) {
   const step = _pbSteps[idx];
   if (step) document.getElementById('progressStepName').textContent = step.name;
 
-  // Reset elapsed ticker for this new step
   const etaEl = document.getElementById('progressEta');
-  if (etaEl) {
-    delete etaEl.dataset.finalised;
-    etaEl.textContent = `step 0s · total 0s`;
-  }
+  if (etaEl) { delete etaEl.dataset.finalised; }
 }
 
 function _finishProgressBar() {
@@ -1534,24 +1600,69 @@ function _finishProgressBar() {
 }
 
 function _parseStepFromMessage(msg) {
-  // Detect step markers like [1/4], [2/4], [3/4], [4/4] or [1/3], [2/3], [3/3]
+  // Chunk progress: "Processing N chunks" or "Chunk X/N done"
+  const chunksStartM = msg.match(/Processing (\d+) chunks/);
+  if (chunksStartM) { _pbChunksTotal = parseInt(chunksStartM[1]); _pbChunksDone = 0; }
+  const chunkDoneM = msg.match(/Chunk \d+\/(\d+) (?:done|resumed)/);
+  if (chunkDoneM) { _pbChunksTotal = parseInt(chunkDoneM[1]); _pbChunksDone++; }
+
+  // Step markers: [1/4], [2/3] etc.
   const m = msg.match(/^\[(\d+)\/(\d+)\]/);
   if (!m) return;
-  const step  = parseInt(m[1]);
-  const total = parseInt(m[2]);
+  const step = parseInt(m[1]), total = parseInt(m[2]);
 
   if (total === 4) {
-    // Single-pass 4-step pipeline: [1/4]→0, [2/4]→1, [3/4]→2, [4/4]→3
     if (_pbCurrent === -1) _initProgressBar(PIPELINE_4);
     _advanceStep(step - 1);
   } else if (total === 3) {
-    if (_pbCurrent === -1) {
-      // Chunked pipeline — only initialise 3-step if 4-step hasn't started yet
-      _initProgressBar(PIPELINE_3);
-    }
+    if (_pbCurrent === -1) _initProgressBar(PIPELINE_3);
     if (_pbSteps === PIPELINE_3) _advanceStep(step - 1);
-    // If somehow in 4-step mode, [N/3] is unexpected — ignore
   }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent mid-flight polling — detect when another precompute starts/ends
+// ---------------------------------------------------------------------------
+function _startConcurrentPoll(jobKey) {
+  _pbJobKey      = jobKey;
+  _pbActiveCount = 1;
+  if (_pbPollTimer) clearInterval(_pbPollTimer);
+  _pbPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(buildUrl('/api/precompute/active'));
+      if (!r.ok) return;
+      const d    = await r.json();
+      const jobs = d.active_jobs || [];
+      const count = jobs.length;
+      if (count === _pbActiveCount) return;
+
+      const others = jobs.filter(j => j.job_key !== _pbJobKey);
+      if (count > _pbActiveCount) {
+        // Someone else started — our effective slots dropped
+        _pbNSlots = Math.max(1, Math.floor(3 / count));
+        _pbTotalEstS = _estimateTotalS(_pbRadius, _pbNSlots);
+        const desc = others.map(j => `${j.radius_m}m`).join(', ');
+        showConcurrentWarning(others);
+        appendProgressLine(
+          `⚠ Another precompute started (${desc}) — your chunks now share resources, expect ~${Math.round(3 / _pbNSlots)}× slower processing`
+        );
+      } else if (count < _pbActiveCount && _pbActiveCount > 1) {
+        // Someone finished — speed restored
+        _pbNSlots = Math.min(3, Math.max(1, Math.floor(3 / Math.max(1, count))));
+        _pbTotalEstS = _estimateTotalS(_pbRadius, _pbNSlots);
+        const warn = document.getElementById('concurrentWarning');
+        warn.classList.remove('visible');
+        warn.textContent = '';
+        appendProgressLine('✓ Other precompute finished — back to full speed');
+      }
+      _pbActiveCount = count;
+    } catch (_) {}
+  }, 12000); // poll every 12s
+}
+
+function _stopConcurrentPoll() {
+  if (_pbPollTimer) { clearInterval(_pbPollTimer); _pbPollTimer = null; }
+  _pbJobKey = null;
 }
 
 function showLoading(text, showProgress) {
@@ -1581,6 +1692,7 @@ function appendProgressLine(msg) {
 
 function hideLoading() {
   if (_pbTickTimer) { clearInterval(_pbTickTimer); _pbTickTimer = null; }
+  _stopConcurrentPoll();
   document.getElementById('loadingOverlay').classList.remove('active');
   const prog = document.getElementById('loadingProgress');
   prog.classList.remove('visible');
@@ -1903,6 +2015,13 @@ async function getBatchPins() {
 // Saves job_key to localStorage so a page refresh can offer to resume.
 // ---------------------------------------------------------------------------
 async function _runPrecomputeStream(lat, lon, radius, tileSource, isResume, concurrentJobs) {
+  // Set ETA state before initialising the progress bar so _initProgressBar
+  // can compute the initial estimate.
+  _pbRadius  = radius;
+  _pbNSlots  = concurrentJobs && concurrentJobs.length > 0
+    ? Math.max(1, Math.floor(3 / (concurrentJobs.length + 1)))
+    : 3;
+
   const verb = isResume ? 'Resuming' : 'Precomputing';
   showLoading(`${verb} ${radius}m radius…`, true);
   if (!isResume) {
@@ -1950,6 +2069,8 @@ async function _runPrecomputeStream(lat, lon, radius, tileSource, isResume, conc
               job_key: data.job_key, lat, lon, radius_m: radius,
               tile_source: tileSource, started_at: Date.now(),
             }));
+            // Start polling for concurrent jobs only once we have a confirmed job key
+            if (!data.reconnected) _startConcurrentPoll(data.job_key);
             if (data.reconnected) {
               appendProgressLine(`↩ Reconnected — replaying ${data.elapsed_s}s of buffered progress…`);
             }
