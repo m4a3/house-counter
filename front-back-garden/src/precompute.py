@@ -21,7 +21,7 @@ import math
 import os
 import pickle
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -102,24 +102,29 @@ BUILDING_CHUNK_THRESHOLD = 2500
 # Cross-process heavy-phase semaphore + RAM admission gate
 # ---------------------------------------------------------------------------
 # Uvicorn runs multiple workers as separate OS processes. A standard
-# threading.Lock() only works within one process. We use an exclusive
-# fcntl file lock on a temp file so that only ONE worker can run the
-# memory-intensive phases (vegetation → classify → pins) at a time.
+# threading.Lock() only works within one process. We use fcntl advisory
+# locks on N separate slot files to implement a cross-process semaphore
+# that allows up to N concurrent holders (across all workers and all
+# chunks in the same worker).
 #
-# Additionally, even after the lock is acquired we re-check available RAM.
-# If the system is still memory-constrained (previous worker's GC hasn't
-# freed yet), we wait here rather than spike into OOM territory. This gives
-# the server a soft 7 GB ceiling: any work that would exceed it is placed
-# on the back burner and runs when memory is available, rather than crashing.
+# The semaphore caps CONCURRENCY of memory-intensive phases. The RAM
+# admission gate (see _wait_for_ram_headroom) caps OVERALL memory usage.
+# Together: at most N chunks running at once, AND never below the free
+# RAM floor — whichever is stricter wins.
 #
-# Step 1 (tile + OSM fetch) is I/O-bound and low-memory — it runs freely
-# in both workers concurrently. Steps 2-4 are the memory-intensive work.
-#
-# The lock is *not* held while writing to cache, so the next worker can
-# start as soon as processing completes and large arrays are freed.
-_HEAVY_LOCK_PATH = "/tmp/garden_heavy_precompute.lock"
+# Why not a single exclusive lock any more? A single lock serialises
+# chunks within one precompute, leaving ~50% of available RAM unused
+# on a lightly-loaded server. N=2–3 lets one request process several
+# chunks in parallel, cutting wall time by ~2-3x.
+_HEAVY_LOCK_DIR = "/tmp/garden_heavy_precompute.d"
 
-# How much free RAM we require before and after acquiring the lock.
+# Maximum number of memory-intensive phases that can run concurrently
+# across all workers and threads. Peak per-chunk spike is ~1-2 GB;
+# 3 slots × 2 GB = 6 GB worst case, fits comfortably under the 7 GB cap.
+# Override via GARDEN_HEAVY_SLOTS env var for tuning.
+_HEAVY_SLOTS: int = int(os.environ.get("GARDEN_HEAVY_SLOTS", "3"))
+
+# How much free RAM we require before acquiring a slot.
 # On an 8 GB server: requiring 1.0 GB free ≈ a 7.0 GB effective ceiling.
 # The single-pass pipeline peaks at ~2 GB (image-size-driven, not building-count).
 # OS + idle worker use ~0.5–1 GB, so total at peak is ~3–4 GB — well under 7 GB.
@@ -130,6 +135,17 @@ _MIN_FREE_RAM_GB: float = 1.0
 
 # How often to re-check RAM while waiting (seconds).
 _RAM_POLL_INTERVAL_S: float = 5.0
+
+# How often the semaphore polls for a free slot when all N are taken.
+_SEM_POLL_INTERVAL_S: float = 1.0
+
+
+def _ensure_lock_dir() -> None:
+    """Create the /tmp/garden_heavy_precompute.d directory if missing."""
+    try:
+        os.makedirs(_HEAVY_LOCK_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 
 def _wait_for_ram_headroom(log_fn: Callable[[str], None] | None = None) -> None:
@@ -164,49 +180,146 @@ def _wait_for_ram_headroom(log_fn: Callable[[str], None] | None = None) -> None:
         time.sleep(_RAM_POLL_INTERVAL_S)
 
 
+def _try_acquire_slot() -> Optional[Tuple[Any, int]]:
+    """
+    Try to acquire any one of the N semaphore slots non-blockingly.
+
+    Returns (fd, slot_index) on success, or None if all slots are taken.
+    The caller owns the fd and MUST close it to release the slot.
+    """
+    _ensure_lock_dir()
+    for slot in range(_HEAVY_SLOTS):
+        path = os.path.join(_HEAVY_LOCK_DIR, f"slot_{slot}.lock")
+        fd = open(path, "w")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd, slot
+        except BlockingIOError:
+            fd.close()
+            continue
+        except Exception:
+            fd.close()
+            continue
+    return None
+
+
 @contextmanager
 def _heavy_phase_lock(log_fn: Callable[[str], None] | None = None):
     """
-    Exclusive cross-process lock for memory-intensive precompute phases.
+    Counting semaphore for memory-intensive precompute phases.
 
     Combines two guards:
-    1. fcntl exclusive file lock — only ONE worker processes at a time.
-    2. RAM admission check — waits until _MIN_FREE_RAM_GB is available,
-       both before and after acquiring the lock.
+    1. fcntl semaphore over N slot files — at most _HEAVY_SLOTS chunks
+       run the heavy phase concurrently (across ALL workers and threads).
+    2. RAM admission check — waits until _MIN_FREE_RAM_GB is available
+       both before acquiring a slot and again after acquiring it.
 
-    The double RAM check matters: the worker that just released the lock
-    may not have had its GC run yet, so RAM could still be high when the
-    next worker acquires. Checking again inside ensures we only start heavy
-    work when memory has actually been freed.
+    The double RAM check matters: another holder may not have had its GC
+    run yet, so RAM could still be high when we acquire a slot. Checking
+    again ensures we only start heavy work when memory has actually freed.
+
+    If all slots are full we poll every _SEM_POLL_INTERVAL_S for a free slot.
     """
-    # Guard 1: don't even compete for the lock if RAM is critically low.
     _wait_for_ram_headroom(log_fn)
 
     if log_fn:
-        log_fn("    [mem-guard] Waiting for memory slot...")
+        log_fn(
+            f"    [mem-guard] Waiting for memory slot "
+            f"(up to {_HEAVY_SLOTS} concurrent)..."
+        )
     t_wait = time.time()
-    fd = open(_HEAVY_LOCK_PATH, "w")
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    acquired: Optional[Tuple[Any, int]] = None
+    while acquired is None:
+        acquired = _try_acquire_slot()
+        if acquired is None:
+            time.sleep(_SEM_POLL_INTERVAL_S)
+            _wait_for_ram_headroom(log_fn)
 
-        # Guard 2: re-check RAM now that we hold the lock. The previous
-        # worker's large arrays may still be in memory if its GC is delayed.
+    fd, slot = acquired
+    try:
         _wait_for_ram_headroom(log_fn)
 
         waited = time.time() - t_wait
         if log_fn and waited > 0.5:
             log_fn(
-                f"    [mem-guard] Memory slot acquired after {waited:.1f}s "
+                f"    [mem-guard] Slot {slot} acquired after {waited:.1f}s "
                 f"[RAM: {_ram_str()}]"
             )
         elif log_fn:
-            log_fn(f"    [mem-guard] Memory slot acquired [RAM: {_ram_str()}]")
+            log_fn(
+                f"    [mem-guard] Slot {slot} acquired "
+                f"[RAM: {_ram_str()}]"
+            )
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        fd.close()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            fd.close()
         if log_fn:
-            log_fn(f"    [mem-guard] Memory slot released [RAM: {_ram_str()}]")
+            log_fn(
+                f"    [mem-guard] Slot {slot} released "
+                f"[RAM: {_ram_str()}]"
+            )
+
+
+class _PeakRamSampler:
+    """
+    Background thread that samples process RAM usage at a fixed interval.
+
+    Records the maximum RSS seen between `start()` and `stop()`. Useful for
+    measuring the true peak of a short-lived heavy phase (e.g. one chunk).
+
+    Fallback-safe: if psutil is unavailable, peak_mb is None.
+    """
+
+    def __init__(self, interval_s: float = 0.25) -> None:
+        self._interval = interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.peak_rss_mb: Optional[float] = None
+        self.start_rss_mb: Optional[float] = None
+
+    def _run(self) -> None:
+        if not _PSUTIL_AVAILABLE:
+            return
+        try:
+            proc = _psutil.Process(os.getpid())
+            peak = proc.memory_info().rss
+            self.start_rss_mb = peak / (1024 ** 2)
+            while not self._stop.is_set():
+                try:
+                    rss = proc.memory_info().rss
+                    if rss > peak:
+                        peak = rss
+                except Exception:
+                    break
+                self._stop.wait(self._interval)
+            self.peak_rss_mb = peak / (1024 ** 2)
+        except Exception:
+            return
+
+    def __enter__(self) -> "_PeakRamSampler":
+        if _PSUTIL_AVAILABLE:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def summary(self) -> str:
+        if self.peak_rss_mb is None:
+            return "peak RSS: n/a"
+        if self.start_rss_mb is None:
+            return f"peak RSS: {self.peak_rss_mb:.0f} MB"
+        delta = self.peak_rss_mb - self.start_rss_mb
+        return (
+            f"peak RSS: {self.peak_rss_mb:.0f} MB "
+            f"(Δ+{delta:.0f} MB from start)"
+        )
 
 
 @dataclass
@@ -1706,44 +1819,70 @@ class PrecomputeManager:
 
         chunks = self._generate_chunk_grid(center_lat, center_lon, radius_m)
         n_chunks = len(chunks)
-        _log(f"[2/3] Processing {n_chunks} chunks "
-             f"({CHUNK_SIZE_M}m grid, {CHUNK_OVERLAP_M}m overlap)...")
 
-        all_pins: List[DeliveryPin] = []
+        # Chunks run concurrently up to the semaphore cap. Each thread does
+        # its own cache check / crop / OSM filter / heavy phase / persist.
+        # The semaphore inside _heavy_phase_lock caps concurrent heavy phases;
+        # the ThreadPoolExecutor's max_workers matches so we don't spin up
+        # threads that will just sit on the semaphore.
+        chunk_workers = max(1, _HEAVY_SLOTS)
+        _log(
+            f"[2/3] Processing {n_chunks} chunks "
+            f"({CHUNK_SIZE_M}m grid, {CHUNK_OVERLAP_M}m overlap, "
+            f"up to {chunk_workers} concurrent)..."
+        )
 
-        for ci, chunk in enumerate(chunks):
+        # Serialise log output so concurrent chunk threads don't interleave.
+        _log_lock = threading.Lock()
+
+        def _tlog(msg: str) -> None:
+            with _log_lock:
+                _log(msg)
+
+        def _process_one_chunk(ci: int, chunk: Dict[str, Any]) -> List[DeliveryPin]:
             chunk_cache_path = cache_path.parent / f"{cache_path.stem}_chunk{ci}.pkl"
 
-            # Resume from partial cache if available.
             if chunk_cache_path.exists():
                 try:
                     with open(chunk_cache_path, "rb") as f:
                         saved_pins = pickle.load(f)
-                    _log(f"    Chunk {ci + 1}/{n_chunks}... resumed from partial cache "
-                         f"({len(saved_pins)} pins)")
-                    all_pins.extend(saved_pins)
-                    continue
+                    _tlog(
+                        f"    Chunk {ci + 1}/{n_chunks} resumed from partial cache "
+                        f"({len(saved_pins)} pins)"
+                    )
+                    return saved_pins
                 except Exception:
                     chunk_cache_path.unlink(missing_ok=True)
 
-            _log(f"    Chunk {ci + 1}/{n_chunks}... [RAM: {_ram_str()}]")
+            _tlog(
+                f"    Chunk {ci + 1}/{n_chunks} starting... [RAM: {_ram_str()}]"
+            )
+            t_chunk = time.time()
 
             image, metadata = _crop_chunk_image(chunk)
             if image is None:
-                continue
+                return []
 
-            # Filter OSM data to chunk full bounds.
             fb = chunk["full_bounds"]
             cb = chunk["core_bounds"]
             c_buildings = buildings[buildings.intersects(fb)].copy()
             c_roads = roads[roads.intersects(fb)].copy()
-            c_driveways = driveways[driveways.intersects(fb)].copy() if not driveways.empty else driveways
+            c_driveways = (
+                driveways[driveways.intersects(fb)].copy()
+                if not driveways.empty else driveways
+            )
             _empty = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-            c_addr = address_polygons[address_polygons.intersects(fb)].copy() if not address_polygons.empty else _empty
-            c_prop = property_boundaries[property_boundaries.intersects(fb)].copy() if not property_boundaries.empty else _empty
+            c_addr = (
+                address_polygons[address_polygons.intersects(fb)].copy()
+                if not address_polygons.empty else _empty
+            )
+            c_prop = (
+                property_boundaries[property_boundaries.intersects(fb)].copy()
+                if not property_boundaries.empty else _empty
+            )
 
             if c_buildings.empty:
-                continue
+                return []
 
             c_buildings = c_buildings.reset_index(drop=True)
             c_roads = c_roads.reset_index(drop=True)
@@ -1754,25 +1893,50 @@ class PrecomputeManager:
             geo_bounds = metadata["geo_bounds"]
             image_size = tuple(metadata["image_size"])
 
-            # Acquire the cross-process lock for this chunk's heavy phases.
-            # Image data is already cropped (cheap); only vegetation→classify→pins
-            # is memory-intensive. Holding the lock per-chunk (not per-full-precompute)
-            # lets the other worker process its own chunks between ours.
-            with _heavy_phase_lock(_log):
+            # Acquire a semaphore slot for this chunk's heavy phases.
+            # Up to _HEAVY_SLOTS chunks run concurrently across all workers
+            # and all chunks; the RAM admission gate enforces the absolute
+            # ceiling if slots alone aren't restrictive enough.
+            with _heavy_phase_lock(_tlog), _PeakRamSampler() as sampler:
                 chunk_pins = self._process_chunk_pins(
                     image, geo_bounds, image_size,
                     c_buildings, c_roads, c_driveways, c_addr, c_prop,
                     center_lat, center_lon, cb,
                 )
 
-            # Persist chunk pins so an interrupted run can resume here.
+            elapsed = time.time() - t_chunk
+            _tlog(
+                f"    Chunk {ci + 1}/{n_chunks} done in {elapsed:.1f}s "
+                f"({len(chunk_pins)} pins, {sampler.summary()})"
+            )
+
             try:
                 with open(chunk_cache_path, "wb") as f:
                     pickle.dump(chunk_pins, f)
             except Exception:
                 pass
 
-            all_pins.extend(chunk_pins)
+            return chunk_pins
+
+        all_pins: List[DeliveryPin] = []
+        with ThreadPoolExecutor(
+            max_workers=chunk_workers,
+            thread_name_prefix="chunk",
+        ) as executor:
+            futures = {
+                executor.submit(_process_one_chunk, ci, chunk): ci
+                for ci, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                ci = futures[future]
+                try:
+                    chunk_pins = future.result()
+                    all_pins.extend(chunk_pins)
+                except Exception as e:
+                    _log(
+                        f"    Chunk {ci + 1}/{n_chunks} failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
 
         # Release the full image now that all chunks are cropped — it can be
         # ~880 MB for a 3 km radius and is no longer needed.
