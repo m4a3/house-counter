@@ -2061,34 +2061,16 @@ async function checkCacheStatus() {
   if (isNaN(lat) || isNaN(lon)) { badge.style.display = 'none'; return; }
 
   try {
-    // Fire precompute with a read that returns immediately if cached;
-    // abort after 2s so we don't accidentally trigger a long precompute.
-    const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), 2000);
-
-    const r = await fetch(buildUrl('/api/precompute'), {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ lat, lon, radius_m: radius }),
-      signal:  ctrl.signal,
-    });
-    clearTimeout(timeout);
-
-    // Read first SSE chunk only
-    const reader  = r.body.getReader();
-    const decoder = new TextDecoder();
-    const { value } = await reader.read();
-    reader.cancel();
-
-    const text = decoder.decode(value || new Uint8Array());
-    const cached = text.includes('"from_cache": true') || text.includes('"from_cache":true');
+    const url = buildUrl(`/api/precompute/check?lat=${lat}&lon=${lon}&radius_m=${radius}`);
+    const r = await fetch(url);
+    if (!r.ok) { badge.style.display = 'none'; return; }
+    const { cached } = await r.json();
 
     badge.style.display = 'block';
     badge.innerHTML = cached
       ? `<span class="cache-badge cached">✓ Cached — pins ready</span>`
       : `<span class="cache-badge uncached">○ Not cached — precompute needed</span>`;
   } catch (_) {
-    // Abort or network error — don't show badge
     badge.style.display = 'none';
   }
 }
