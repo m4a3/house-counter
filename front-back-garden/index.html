@@ -491,6 +491,20 @@ body {
 .loading-progress .prog-line { padding: 1px 0; line-height: 1.5; }
 .loading-progress .prog-line.step { color: var(--accent); font-weight: 600; }
 .loading-progress .prog-line.sub { color: var(--text-dim); padding-left: 8px; }
+.loading-progress .prog-line.warn { color: var(--orange); font-weight: 600; }
+.concurrent-warning {
+  display: none;
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: rgba(245,158,11,0.12);
+  border: 1px solid rgba(245,158,11,0.35);
+  border-radius: 6px;
+  color: var(--orange);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+.concurrent-warning.visible { display: block; }
 
 .cache-badge {
   display: inline-flex;
@@ -1071,6 +1085,7 @@ footer a:hover { text-decoration: underline; }
         </div>
       </div>
 
+      <div class="concurrent-warning" id="concurrentWarning"></div>
       <div class="loading-progress" id="loadingProgress"></div>
     </div>
     <div class="results-drawer" id="resultsDrawer">
@@ -1571,7 +1586,19 @@ function hideLoading() {
   prog.classList.remove('visible');
   prog.innerHTML = '';
   document.getElementById('progressBarWrap').classList.remove('visible');
+  const warn = document.getElementById('concurrentWarning');
+  warn.classList.remove('visible');
+  warn.textContent = '';
   _pbCurrent = -1;
+}
+
+function showConcurrentWarning(activeJobs) {
+  const warn = document.getElementById('concurrentWarning');
+  const desc = activeJobs.map(j =>
+    `${j.radius_m}m at ${j.lat?.toFixed(4)}, ${j.lon?.toFixed(4)}`
+  ).join('; ');
+  warn.textContent = `⚠ Another precompute is already running (${desc}) — expect slower processing due to shared resources.`;
+  warn.classList.add('visible');
 }
 
 function showResults(title, html) {
@@ -1875,12 +1902,17 @@ async function getBatchPins() {
 // Precompute — streams SSE progress, then auto-loads pins on completion.
 // Saves job_key to localStorage so a page refresh can offer to resume.
 // ---------------------------------------------------------------------------
-async function _runPrecomputeStream(lat, lon, radius, tileSource, isResume) {
+async function _runPrecomputeStream(lat, lon, radius, tileSource, isResume, concurrentJobs) {
   const verb = isResume ? 'Resuming' : 'Precomputing';
   showLoading(`${verb} ${radius}m radius…`, true);
   if (!isResume) {
     appendProgressLine(`Starting precompute for ${radius}m at ${lat.toFixed(5)}, ${lon.toFixed(5)}…`);
     _initProgressBar(PIPELINE_4); // initialise now; will switch to PIPELINE_3 if needed
+    if (concurrentJobs && concurrentJobs.length > 0) {
+      showConcurrentWarning(concurrentJobs);
+      const desc = concurrentJobs.map(j => `${j.radius_m}m at ${j.lat?.toFixed(4)}, ${j.lon?.toFixed(4)}`).join(', ');
+      appendProgressLine(`⚠ Another precompute is running (${desc}) — processing will be slower`);
+    }
   } else {
     appendProgressLine(`Reconnecting to in-progress precompute…`);
   }
@@ -1963,7 +1995,22 @@ async function precomputeArea() {
   const radius     = parseInt(document.getElementById('batchRadius').value) || 200;
   const tileSource = document.getElementById('batchTileSource').value;
   const [lat, lon] = coords.split(',').map(s => parseFloat(s.trim()));
-  await _runPrecomputeStream(lat, lon, radius, tileSource, false);
+
+  // Check if any other precomputes are already running before kicking off.
+  // We still proceed — this is informational, not a block.
+  let concurrentJobs = [];
+  try {
+    const r = await fetch(buildUrl('/api/precompute/active'));
+    if (r.ok) {
+      const d = await r.json();
+      // Exclude a job at the same lat/lon/radius (i.e. reconnecting to our own)
+      concurrentJobs = (d.active_jobs || []).filter(j =>
+        !(Math.abs(j.lat - lat) < 0.0001 && Math.abs(j.lon - lon) < 0.0001 && j.radius_m === radius)
+      );
+    }
+  } catch (_) {}
+
+  await _runPrecomputeStream(lat, lon, radius, tileSource, false, concurrentJobs);
 }
 
 // ---------------------------------------------------------------------------
