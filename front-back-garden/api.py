@@ -1028,6 +1028,18 @@ async def get_active_precomputes():
     return {"active_jobs": active}
 
 
+@app.get("/api/precompute/check")
+async def check_precompute_cached(lat: float, lon: float, radius_m: float):
+    """
+    Lightweight cache probe — returns whether an area is already precomputed.
+
+    Never triggers a precompute. Safe to call on every map click or input change.
+    """
+    manager = PrecomputeManager()
+    cached = manager.is_area_cached(lat, lon, radius_m)
+    return {"cached": cached, "lat": lat, "lon": lon, "radius_m": radius_m}
+
+
 @app.get("/api/cache/stats", response_model=CacheStatsResponse)
 async def get_cache_stats():
     """Get statistics about the caches."""
