@@ -1,0 +1,31 @@
+name: Verify Notion Task
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  verify-notion-task:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: |
+          echo '{}' > package.json
+          npm i @actions/core @actions/github @notionhq/client
+
+      - name: Validate MNA Task
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_STATUS_PROPERTY: Status
+          NOTION_BLOCKED_STATUSES: Done,Completed
+        run: node .github/scripts/verify-notion-task.mjs
