@@ -21,6 +21,7 @@ env/
 
 # Service caches and output
 house-counter/building_cache/
+house-counter/contributions/
 front-back-garden/output/
 output/
 cache/

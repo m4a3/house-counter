@@ -25,10 +25,11 @@ COPY ms_buildings.py .
 COPY osm_query.py .
 COPY visualization.py .
 COPY cache_manager.py .
+COPY contributor.py .
 COPY static/ static/
 
-# Create building cache directory
-RUN mkdir -p building_cache
+# Create building cache + contributor store directories
+RUN mkdir -p building_cache contributions
 
 EXPOSE 8008
 
