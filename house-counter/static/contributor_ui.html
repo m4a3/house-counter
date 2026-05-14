@@ -1,0 +1,1214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OSM Contributor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+  <style>
+    #map { height: 100%; width: 100%; }
+    .leaflet-control-attribution { font-size: 10px; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+    /* Candidate popup */
+    .leaflet-popup-content-wrapper { background: #0f172a; color: #e2e8f0; border-radius: 8px; }
+    .leaflet-popup-tip { background: #0f172a; }
+    .leaflet-popup-content { margin: 10px 12px; font-size: 12px; line-height: 1.4; }
+
+    /* Toast */
+    .toast { animation: slideIn 0.25s ease-out, fadeOut 0.3s ease-in 3.0s forwards; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+
+    /* Pulse for active detection */
+    @keyframes pulseRing {
+      0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.6); }
+      80% { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+    }
+    .detecting { animation: pulseRing 1.4s ease-out infinite; }
+
+    /* Subtle row hover */
+    .contrib-row:hover { background-color: #1e293b; }
+  </style>
+</head>
+<body class="bg-slate-950 text-white h-screen flex flex-col overflow-hidden">
+
+  <!-- ============================================================ -->
+  <!-- HEADER                                                        -->
+  <!-- ============================================================ -->
+  <header class="bg-slate-900 border-b border-slate-800 px-5 py-3 flex items-center justify-between flex-shrink-0 z-10">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-orange-600 flex items-center justify-center text-sm font-bold">C</div>
+      <h1 class="text-base font-semibold tracking-tight">OSM Contributor</h1>
+      <span class="text-xs text-slate-500">Overture-assisted building polygons</span>
+    </div>
+    <div id="stats-bar" class="flex items-center gap-5 text-xs text-slate-400">
+      <span id="stat-osm">OSM: 0</span>
+      <span id="stat-candidates">Candidates: 0</span>
+      <span id="stat-approved">Approved: 0</span>
+    </div>
+  </header>
+
+  <!-- ============================================================ -->
+  <!-- MAIN LAYOUT                                                   -->
+  <!-- ============================================================ -->
+  <div class="flex flex-1 overflow-hidden">
+
+    <!-- SIDEBAR -->
+    <aside class="w-[360px] bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0 overflow-hidden">
+
+      <!-- Search section -->
+      <div class="px-3 py-2.5 space-y-2 flex-shrink-0">
+        <h3 class="text-[10px] font-semibold text-slate-300 uppercase tracking-wider">Search Area</h3>
+
+        <!-- Single coords input — accepts "lat, lon" or just "lat" -->
+        <div class="flex gap-1.5">
+          <input type="text" id="search-coords"
+            placeholder="lat, lon  (e.g. 36.06, -95.82)"
+            onpaste="setTimeout(() => parseCoordsInput(this.value), 0)"
+            onchange="parseCoordsInput(this.value)"
+            class="flex-1 bg-slate-800 border border-slate-700 rounded-md px-2 py-1.5 text-xs font-mono
+                   focus:outline-none focus:border-orange-500" />
+          <button onclick="useMapCenter()" title="Use map center"
+            class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300
+                   rounded-md px-2 py-1.5 text-[11px] transition-colors flex-shrink-0">
+            Center
+          </button>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <label class="text-[10px] text-slate-500 flex-shrink-0">Radius</label>
+          <input type="range" id="search-radius-m" min="50" max="3000" step="50" value="200"
+            oninput="document.getElementById('radius-label').textContent = this.value + ' m'"
+            class="flex-1" />
+          <span id="radius-label" class="text-[11px] text-slate-300 font-medium w-12 text-right">200 m</span>
+        </div>
+
+        <div class="flex gap-1.5">
+          <button onclick="runDetection()" id="detect-btn"
+            class="flex-1 bg-orange-600 hover:bg-orange-500 disabled:opacity-40 disabled:cursor-not-allowed
+                   text-white rounded-md py-1.5 text-xs font-semibold transition-colors">
+            Detect
+          </button>
+          <button onclick="approveAllCandidates()" id="approve-all-btn" disabled
+            class="flex-1 bg-emerald-700/30 hover:bg-emerald-700 disabled:opacity-30 disabled:cursor-not-allowed
+                   border border-emerald-600/60 text-emerald-100 rounded-md py-1.5 text-xs font-semibold transition-colors">
+            Approve all
+          </button>
+        </div>
+
+        <div class="flex gap-1.5">
+          <button onclick="toggleCandidateSelectMode()" id="cand-select-toggle"
+            class="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200
+                   rounded-md py-1 text-[11px] font-medium transition-colors">
+            Select mode
+          </button>
+          <button onclick="approveSelectedCandidates()" id="cand-approve-selected-btn" disabled
+            class="flex-1 hidden bg-emerald-700/30 hover:bg-emerald-700 disabled:opacity-30 disabled:cursor-not-allowed
+                   border border-emerald-600/60 text-emerald-100 rounded-md py-1 text-[11px] font-semibold transition-colors">
+            Approve selected (0)
+          </button>
+        </div>
+
+        <details class="text-[10px]">
+          <summary class="text-slate-500 cursor-pointer hover:text-slate-400 select-none">Advanced</summary>
+          <label class="flex items-center gap-1.5 mt-1.5 text-slate-300 cursor-pointer">
+            <input type="checkbox" id="bypass-cache"
+              class="rounded border-slate-600 bg-slate-800" />
+            <span>Bypass OSM cache (force fresh Overpass fetch)</span>
+          </label>
+        </details>
+      </div>
+
+      <div class="border-t border-slate-800 flex-shrink-0"></div>
+
+      <!-- Layer toggles + basemap, all in one tight section -->
+      <div class="px-3 py-2 space-y-1 flex-shrink-0">
+        <div class="flex items-center justify-between">
+          <h3 class="text-[10px] font-semibold text-slate-300 uppercase tracking-wider">Layers</h3>
+          <select id="basemap-select" onchange="setBasemap(this.value)"
+            class="bg-slate-800 border border-slate-700 rounded px-1.5 py-0.5 text-[10px]">
+            <option value="sat">Satellite</option>
+            <option value="osm">OSM</option>
+          </select>
+        </div>
+        <div class="grid grid-cols-3 gap-1">
+          <label class="flex items-center gap-1 text-[10px] text-slate-200 cursor-pointer">
+            <input type="checkbox" id="toggle-osm" checked
+              class="rounded border-slate-600 bg-slate-800 text-blue-500 w-3 h-3" />
+            <span class="w-2 h-2 rounded-sm" style="background: #3b82f6"></span>
+            <span>OSM</span>
+          </label>
+          <label class="flex items-center gap-1 text-[10px] text-slate-200 cursor-pointer">
+            <input type="checkbox" id="toggle-candidates" checked
+              class="rounded border-slate-600 bg-slate-800 text-orange-500 w-3 h-3" />
+            <span class="w-2 h-2 rounded-sm" style="background: #f97316"></span>
+            <span>Cand.</span>
+          </label>
+          <label class="flex items-center gap-1 text-[10px] text-slate-200 cursor-pointer">
+            <input type="checkbox" id="toggle-approved" checked
+              class="rounded border-slate-600 bg-slate-800 text-emerald-500 w-3 h-3" />
+            <span class="w-2 h-2 rounded-sm" style="background: #10b981"></span>
+            <span>Approved</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="border-t border-slate-800 flex-shrink-0"></div>
+
+      <!-- Contributions list — flex-1 so it gets all the remaining space -->
+      <div class="px-3 py-2 flex-1 min-h-0 flex flex-col">
+        <div class="flex items-center justify-between mb-1.5 flex-shrink-0">
+          <h3 class="text-[10px] font-semibold text-slate-300 uppercase tracking-wider">
+            Approved (<span id="contrib-count">0</span>)
+          </h3>
+          <button onclick="refreshContributions()"
+            class="text-[10px] text-slate-500 hover:text-slate-300 transition-colors">
+            Refresh
+          </button>
+        </div>
+
+        <div class="flex gap-1 mb-1.5 flex-shrink-0">
+          <button onclick="toggleApprovedSelectMode()" id="apr-select-toggle"
+            class="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200
+                   rounded py-0.5 text-[10px] font-medium transition-colors">
+            Select
+          </button>
+          <button onclick="deleteSelectedApproved()" id="apr-delete-selected-btn" disabled
+            class="flex-1 hidden bg-rose-700/30 hover:bg-rose-700 disabled:opacity-30 disabled:cursor-not-allowed
+                   border border-rose-600/60 text-rose-100 rounded py-0.5 text-[10px] font-medium transition-colors">
+            Delete sel. (0)
+          </button>
+          <button onclick="deleteAllApproved()" id="apr-delete-all-btn" disabled
+            class="flex-1 bg-rose-900/40 hover:bg-rose-800 disabled:opacity-30 disabled:cursor-not-allowed
+                   border border-rose-700/60 text-rose-200 rounded py-0.5 text-[10px] font-medium transition-colors">
+            Delete all
+          </button>
+        </div>
+
+        <div id="contrib-list" class="flex-1 overflow-y-auto space-y-1 text-xs text-slate-400 pr-1">
+          <div class="text-[11px] italic text-slate-600">No contributions yet.</div>
+        </div>
+      </div>
+
+      <div class="border-t border-slate-800 flex-shrink-0"></div>
+
+      <!-- Export footer -->
+      <div class="px-3 py-2 flex-shrink-0">
+        <button onclick="exportGeoJson()"
+          class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed
+                 text-white rounded-md py-1.5 text-xs font-semibold transition-colors">
+          Export GeoJSON
+        </button>
+      </div>
+    </aside>
+
+    <!-- MAP AREA -->
+    <main class="flex-1 relative">
+      <div id="map"></div>
+
+      <!-- Loading overlay -->
+      <div id="loading" class="hidden absolute inset-0 z-[400] flex items-center justify-center pointer-events-none">
+        <div class="bg-slate-900/90 border border-slate-700 rounded-lg px-4 py-3 text-sm text-slate-200 detecting">
+          <span id="loading-text">Detecting…</span>
+        </div>
+      </div>
+
+      <!-- Toast container -->
+      <div id="toast-container" class="absolute top-4 right-4 z-[500] space-y-2 pointer-events-none"></div>
+
+      <!-- Editor panel — bottom-right corner, never overlaps the polygon being edited -->
+      <div id="editor-panel"
+        class="hidden absolute bottom-4 right-4 z-[450] w-72 bg-slate-900/95 backdrop-blur
+               border border-slate-700 rounded-lg shadow-2xl text-xs text-slate-200">
+        <div id="editor-panel-content" class="p-3 space-y-2"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- JS                                                            -->
+  <!-- ============================================================ -->
+  <script>
+    // ---------------------------------------------------------------
+    // Config & state
+    // ---------------------------------------------------------------
+    const API_BASE = ""; // relative to current host
+
+    const map = L.map("map", { zoomControl: true }).setView([53.3752, -6.382864], 17);
+
+    const basemaps = {
+      osm: L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors",
+      }),
+      sat: L.tileLayer("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", {
+        maxZoom: 20,
+        attribution: "Imagery &copy; Google",
+      }),
+    };
+    basemaps.sat.addTo(map);
+    let activeBasemap = "sat";
+
+    function setBasemap(key) {
+      if (key === activeBasemap) return;
+      map.removeLayer(basemaps[activeBasemap]);
+      basemaps[key].addTo(map);
+      activeBasemap = key;
+    }
+
+    // Layer groups -------------------------------------------------
+    const osmLayer = L.featureGroup().addTo(map);
+    const candidatesLayer = L.featureGroup().addTo(map);
+    const approvedLayer = L.featureGroup().addTo(map);
+
+    // Layer toggles
+    document.getElementById("toggle-osm").addEventListener("change", e => {
+      e.target.checked ? map.addLayer(osmLayer) : map.removeLayer(osmLayer);
+    });
+    document.getElementById("toggle-candidates").addEventListener("change", e => {
+      e.target.checked ? map.addLayer(candidatesLayer) : map.removeLayer(candidatesLayer);
+    });
+    document.getElementById("toggle-approved").addEventListener("change", e => {
+      e.target.checked ? map.addLayer(approvedLayer) : map.removeLayer(approvedLayer);
+    });
+
+    // Styles -------------------------------------------------------
+    const STYLE_OSM = { color: "#3b82f6", weight: 1.5, fillColor: "#3b82f6", fillOpacity: 0.15 };
+    const STYLE_CANDIDATE = {
+      color: "#f97316", weight: 2, dashArray: "4 4",
+      fillColor: "#f97316", fillOpacity: 0.18,
+    };
+    const STYLE_CANDIDATE_EDITING = {
+      color: "#facc15", weight: 2.5, dashArray: null,
+      fillColor: "#facc15", fillOpacity: 0.22,
+    };
+    const STYLE_APPROVED = { color: "#10b981", weight: 2, fillColor: "#10b981", fillOpacity: 0.25 };
+    const STYLE_CANDIDATE_SELECTED = {
+      color: "#facc15", weight: 4, dashArray: null,
+      fillColor: "#f97316", fillOpacity: 0.35,
+    };
+    const STYLE_APPROVED_SELECTED = {
+      color: "#facc15", weight: 4,
+      fillColor: "#10b981", fillOpacity: 0.45,
+    };
+
+    // Select-mode state ------------------------------------------------
+    let candidateSelectMode = false;
+    let approvedSelectMode = false;
+    const selectedCandidates = new Set();   // direct Leaflet layer refs
+    const selectedApproved = new Set();
+
+    // Manual draw toolbar (polygon only) ---------------------------
+    const drawnItems = L.featureGroup().addTo(map);
+    const drawControl = new L.Control.Draw({
+      position: "topright",
+      draw: {
+        polygon: {
+          allowIntersection: false,
+          showArea: true,
+          shapeOptions: STYLE_CANDIDATE_EDITING,
+        },
+        polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false,
+      },
+      edit: { featureGroup: drawnItems, remove: false },
+    });
+    map.addControl(drawControl);
+
+    map.on(L.Draw.Event.CREATED, e => {
+      // Manual polygon drawn from scratch
+      const layer = e.layer;
+      drawnItems.addLayer(layer);
+      const feature = { type: "Feature", geometry: layer.toGeoJSON().geometry, properties: {} };
+      openSavePopup(layer, feature, { source: "manual", original_id: null, edited: false });
+    });
+
+    // ---------------------------------------------------------------
+    // Toast helper
+    // ---------------------------------------------------------------
+    function toast(message, kind = "info") {
+      const colors = {
+        info:    "bg-slate-800 border-slate-600 text-slate-100",
+        success: "bg-emerald-900/80 border-emerald-600 text-emerald-100",
+        error:   "bg-rose-900/80 border-rose-600 text-rose-100",
+      };
+      const el = document.createElement("div");
+      el.className = `toast pointer-events-auto border rounded-lg px-3 py-2 text-xs max-w-xs shadow-lg ${colors[kind] || colors.info}`;
+      el.textContent = message;
+      document.getElementById("toast-container").appendChild(el);
+      setTimeout(() => el.remove(), 3500);
+    }
+
+    // ---------------------------------------------------------------
+    // Search area helpers
+    // ---------------------------------------------------------------
+    function useMapCenter() {
+      const c = map.getCenter();
+      document.getElementById("search-coords").value =
+        `${c.lat.toFixed(6)}, ${c.lng.toFixed(6)}`;
+    }
+
+    // Accept many paste shapes:
+    //   "36.060345, -95.816314"
+    //   "36.060345 -95.816314"
+    //   "36.060345,-95.816314"
+    //   "lat: 36.06, lon: -95.81"
+    //   Google Maps style "36.060345°N, 95.816314°W"
+    function parseCoordsInput(value) {
+      if (!value) return null;
+      const cleaned = value
+        .replace(/[°NSEW]/gi, "")
+        .replace(/(lat|lon|long|longitude|latitude)\s*[:=]?/gi, "")
+        .trim();
+      const parts = cleaned.split(/[\s,;]+/).map(s => parseFloat(s)).filter(n => isFinite(n));
+      if (parts.length < 2) return null;
+      const [lat, lon] = parts;
+      if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+      // Re-format so the input shows a clean canonical form
+      document.getElementById("search-coords").value =
+        `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+      return { lat, lon };
+    }
+
+    function searchParams() {
+      const parsed = parseCoordsInput(document.getElementById("search-coords").value);
+      if (!parsed) {
+        toast("Coords must be 'lat, lon' (try Center).", "error");
+        return null;
+      }
+      const radius_m = parseFloat(document.getElementById("search-radius-m").value);
+      return { lat: parsed.lat, lon: parsed.lon, radius_km: radius_m / 1000 };
+    }
+
+    // Pre-fill with map center so first-time users get a 1-click flow
+    useMapCenter();
+
+    // ---------------------------------------------------------------
+    // Detection
+    // ---------------------------------------------------------------
+    async function runDetection() {
+      const p = searchParams();
+      if (!p) return;
+
+      const btn = document.getElementById("detect-btn");
+      btn.disabled = true;
+      document.getElementById("loading").classList.remove("hidden");
+      document.getElementById("loading-text").textContent = "Detecting…";
+
+      // Any in-flight editor would point at a layer we're about to clear.
+      hideEditorPanel();
+      activeEditLayer = null;
+
+      try {
+        const bypass = document.getElementById("bypass-cache").checked;
+        const qs = `lat=${p.lat}&lon=${p.lon}&radius_km=${p.radius_km}&bypass_cache=${bypass}`;
+        // Fire both requests in parallel but tolerate partial failures.
+        const [osmSettled, candSettled] = await Promise.allSettled([
+          fetch(`${API_BASE}/contribute/osm-buildings?${qs}`).then(async r => {
+            if (!r.ok) throw new Error(`OSM ${r.status}: ${(await r.json().catch(() => ({}))).detail || r.statusText}`);
+            return r.json();
+          }),
+          fetch(`${API_BASE}/contribute/overture-candidates?${qs}`).then(async r => {
+            if (!r.ok) throw new Error(`Candidates ${r.status}: ${(await r.json().catch(() => ({}))).detail || r.statusText}`);
+            return r.json();
+          }),
+        ]);
+        const osmRes = osmSettled.status === "fulfilled"
+          ? osmSettled.value
+          : { type: "FeatureCollection", features: [], _error: osmSettled.reason };
+        const candRes = candSettled.status === "fulfilled"
+          ? candSettled.value
+          : { type: "FeatureCollection", features: [], meta: { osm_available: false, osm_error: String(candSettled.reason) } };
+
+        if (osmRes._error) {
+          toast(`OSM lookup failed: ${osmRes._error.message || osmRes._error}. Showing Overture without OSM context.`, "info");
+        }
+        if (candRes.meta && candRes.meta.osm_available === false) {
+          toast(`OSM unavailable — candidates may include buildings already in OSM. Try Bypass cache later or check Overpass status.`, "info");
+        }
+
+        // OSM layer (read-only, blue) — flatten the GeoJSON wrapper so
+        // toggling visibility / counting children works as a flat group
+        osmLayer.clearLayers();
+        L.geoJSON(osmRes, { style: STYLE_OSM, interactive: false })
+          .eachLayer(l => osmLayer.addLayer(l));
+
+        // Candidates layer (orange, click-to-edit) — same flattening so
+        // candidatesLayer.eachLayer iterates polygons (each with _feature),
+        // not a single GeoJSON wrapper.
+        candidatesLayer.clearLayers();
+        let candidateCount = 0;
+        L.geoJSON(candRes, { style: STYLE_CANDIDATE })
+          .eachLayer(polyLayer => {
+            candidateCount++;
+            attachCandidateBehaviour(polyLayer.feature, polyLayer);
+            candidatesLayer.addLayer(polyLayer);
+          });
+
+        // Pan + draw search radius circle
+        L.circle([p.lat, p.lon], {
+          radius: p.radius_km * 1000,
+          color: "#facc15", weight: 1, dashArray: "3 5",
+          fill: false, interactive: false,
+        }).addTo(candidatesLayer);
+        map.fitBounds(L.latLngBounds(
+          [p.lat - p.radius_km / 111, p.lon - p.radius_km / 111],
+          [p.lat + p.radius_km / 111, p.lon + p.radius_km / 111],
+        ));
+
+        const osmCount = (osmRes.features || []).length;
+        document.getElementById("stat-osm").textContent = `OSM: ${osmCount}`;
+        document.getElementById("stat-candidates").textContent = `Candidates: ${candidateCount}`;
+        updateApproveAllButton();
+        toast(`Found ${candidateCount} OSM blind-spot candidate(s) in ${p.radius_km * 1000} m.`, "success");
+      } catch (err) {
+        toast(`Detection failed: ${err.message}`, "error");
+        console.error(err);
+      } finally {
+        btn.disabled = false;
+        document.getElementById("loading").classList.add("hidden");
+      }
+    }
+
+    function updateApproveAllButton() {
+      const btn = document.getElementById("approve-all-btn");
+      const count = countCandidates();
+      btn.disabled = count === 0;
+      btn.textContent = count
+        ? `Approve all ${count} candidate${count === 1 ? "" : "s"}`
+        : "Approve all candidates";
+    }
+
+    function countCandidates() {
+      // Only count layers that have a stored _feature (skip the search-radius circle)
+      let n = 0;
+      candidatesLayer.eachLayer(l => { if (l._feature) n++; });
+      return n;
+    }
+
+    async function approveAllCandidates() {
+      const items = [];
+      const layersToRemove = [];
+      candidatesLayer.eachLayer(layer => {
+        if (!layer._feature) return; // skip the search-radius circle
+        if (layer.editing && layer.editing._enabled) {
+          try { layer.editing.disable(); } catch {}
+        }
+        const props = layer._feature.properties || {};
+        items.push({
+          feature: {
+            type: "Feature",
+            geometry: layer.toGeoJSON().geometry,
+            properties: {},
+          },
+          original_id: props.id ? String(props.id) : null,
+          edited: !!layer._edited,
+          original_geometry: layer._originalGeometry || null,
+        });
+        layersToRemove.push(layer);
+      });
+      if (!items.length) {
+        toast("No candidates to approve.", "info");
+        return;
+      }
+      const editedCount = items.filter(i => i.edited).length;
+      const msg =
+        `Approve all ${items.length} candidate(s)?` +
+        (editedCount ? `\n\n${editedCount} have edited vertices and will be saved with your changes.` : "") +
+        `\n\nThe rest use the Overture geometry as-is.`;
+      if (!confirm(msg)) return;
+      await bulkApprove(items, layersToRemove);
+    }
+
+    async function bulkApprove(items, layersToRemove) {
+      if (!items.length) return;
+      document.getElementById("approve-all-btn").disabled = true;
+      document.getElementById("cand-approve-selected-btn").disabled = true;
+      document.getElementById("loading").classList.remove("hidden");
+      document.getElementById("loading-text").textContent = `Approving ${items.length}…`;
+      hideEditorPanel();
+      activeEditLayer = null;
+      try {
+        const res = await fetch(`${API_BASE}/contribute/contributions/bulk`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items, source: "overture" }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const result = await res.json();
+        layersToRemove.forEach(l => {
+          selectedCandidates.delete(l);
+          candidatesLayer.removeLayer(l);
+        });
+        (result.saved || []).forEach(addApprovedFeature);
+        await refreshContributions();
+        updateApproveAllButton();
+        updateCandidateSelectionBtn();
+        document.getElementById("stat-candidates").textContent = `Candidates: ${countCandidates()}`;
+        const kind = result.error_count ? "info" : "success";
+        const summary = result.error_count
+          ? `Saved ${result.saved_count}, ${result.error_count} rejected (see console).`
+          : `Approved ${result.saved_count}.`;
+        toast(summary, kind);
+        if (result.error_count) console.warn("Bulk approve errors:", result.errors);
+      } catch (err) {
+        toast(`Bulk approve failed: ${err.message}`, "error");
+        console.error(err);
+      } finally {
+        document.getElementById("loading").classList.add("hidden");
+        updateApproveAllButton();
+        updateCandidateSelectionBtn();
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Candidate edit + save flow
+    // ---------------------------------------------------------------
+    function attachCandidateBehaviour(feature, layer) {
+      layer._feature = feature;
+      layer._edited = false;
+      // Snapshot the original Overture geometry once at load time so we can
+      // always offer "undo to original" — even after multiple drag passes.
+      layer._originalGeometry = JSON.parse(JSON.stringify(feature.geometry));
+      layer.on("click", () => {
+        if (candidateSelectMode) toggleCandidateSelection(layer);
+        else openCandidateEditor(layer);
+      });
+    }
+
+    function toggleCandidateSelection(layer) {
+      if (selectedCandidates.has(layer)) {
+        selectedCandidates.delete(layer);
+        layer.setStyle(STYLE_CANDIDATE);
+      } else {
+        selectedCandidates.add(layer);
+        layer.setStyle(STYLE_CANDIDATE_SELECTED);
+      }
+      updateCandidateSelectionBtn();
+    }
+
+    function clearCandidateSelection() {
+      selectedCandidates.forEach(l => { try { l.setStyle(STYLE_CANDIDATE); } catch {} });
+      selectedCandidates.clear();
+      updateCandidateSelectionBtn();
+    }
+
+    function updateCandidateSelectionBtn() {
+      const btn = document.getElementById("cand-approve-selected-btn");
+      const n = selectedCandidates.size;
+      btn.disabled = n === 0;
+      btn.textContent = `Approve selected (${n})`;
+    }
+
+    function toggleCandidateSelectMode() {
+      candidateSelectMode = !candidateSelectMode;
+      const toggle = document.getElementById("cand-select-toggle");
+      const sel = document.getElementById("cand-approve-selected-btn");
+      if (candidateSelectMode) {
+        // Close any open editor so it doesn't fight with selection mode.
+        if (activeEditLayer) cancelCandidate(activeEditLayer);
+        toggle.textContent = "Exit select mode";
+        toggle.classList.remove("bg-slate-800", "hover:bg-slate-700", "border-slate-700", "text-slate-200");
+        toggle.classList.add("bg-orange-600", "hover:bg-orange-500", "border-orange-500", "text-white");
+        sel.classList.remove("hidden");
+      } else {
+        clearCandidateSelection();
+        toggle.textContent = "Select mode";
+        toggle.classList.add("bg-slate-800", "hover:bg-slate-700", "border-slate-700", "text-slate-200");
+        toggle.classList.remove("bg-orange-600", "hover:bg-orange-500", "border-orange-500", "text-white");
+        sel.classList.add("hidden");
+      }
+    }
+
+    async function approveSelectedCandidates() {
+      if (!selectedCandidates.size) return;
+      const layers = [...selectedCandidates];
+      const items = layers.map(layer => {
+        if (layer.editing && layer.editing._enabled) {
+          try { layer.editing.disable(); } catch {}
+        }
+        const props = layer._feature.properties || {};
+        return {
+          feature: {
+            type: "Feature",
+            geometry: layer.toGeoJSON().geometry,
+            properties: {},
+          },
+          original_id: props.id ? String(props.id) : null,
+          edited: !!layer._edited,
+          original_geometry: layer._originalGeometry || null,
+        };
+      });
+      if (!confirm(`Approve ${items.length} selected candidate(s)?`)) return;
+      await bulkApprove(items, layers);
+      // Approving exits select-mode automatically — cleaner UX.
+      if (candidateSelectMode) toggleCandidateSelectMode();
+    }
+
+    let activeEditLayer = null;
+
+    function showEditorPanel(html, wireButtons) {
+      const panel = document.getElementById("editor-panel");
+      const content = document.getElementById("editor-panel-content");
+      content.innerHTML = html;
+      panel.classList.remove("hidden");
+      wireButtons && wireButtons(content);
+    }
+
+    function hideEditorPanel() {
+      const panel = document.getElementById("editor-panel");
+      panel.classList.add("hidden");
+      document.getElementById("editor-panel-content").innerHTML = "";
+    }
+
+    function openCandidateEditor(layer) {
+      // Disable any previous edit session
+      if (activeEditLayer && activeEditLayer !== layer && activeEditLayer.editing) {
+        try { activeEditLayer.editing.disable(); } catch {}
+        try { activeEditLayer.setStyle(STYLE_CANDIDATE); } catch {}
+      }
+      activeEditLayer = layer;
+
+      layer.setStyle(STYLE_CANDIDATE_EDITING);
+      if (layer.editing) layer.editing.enable();
+
+      const originalSnapshot = JSON.stringify(layer._originalGeometry);
+      layer.off("edit");
+      layer.on("edit", () => {
+        layer._edited = JSON.stringify(layer.toGeoJSON().geometry) !== originalSnapshot;
+      });
+
+      const props = layer._feature.properties || {};
+      const html = `
+        <div class="flex items-start justify-between">
+          <div class="font-semibold text-slate-100 text-sm">Overture candidate</div>
+          <button class="contrib-cancel text-slate-500 hover:text-slate-200 text-lg leading-none -mt-1 -mr-1"
+            title="Cancel editing">×</button>
+        </div>
+        <div class="text-slate-400 text-[11px]">
+          id: <code class="text-slate-300">${(props.id || "—").toString().slice(0, 12)}</code><br />
+          area: ${props.area_sqm ? props.area_sqm.toFixed(1) : "?"} m² · vertices: ${props.vertex_count ?? "?"}
+        </div>
+        <div class="text-slate-500 text-[10px] leading-tight">
+          Drag any vertex to refine, or click an edge midpoint to insert one.
+        </div>
+        <div class="flex gap-1.5 pt-1">
+          <button class="contrib-add flex-1 bg-emerald-600 hover:bg-emerald-500 rounded px-2 py-1.5 text-white text-xs font-medium">
+            Add
+          </button>
+          <button class="contrib-undo flex-1 bg-amber-700/50 hover:bg-amber-700 border border-amber-600/60 rounded px-2 py-1.5 text-amber-100 text-xs font-medium">
+            Undo edits
+          </button>
+        </div>
+      `;
+      showEditorPanel(html, (root) => {
+        root.querySelector(".contrib-add").addEventListener("click", () => approveCandidate(layer));
+        root.querySelector(".contrib-cancel").addEventListener("click", () => cancelCandidate(layer));
+        root.querySelector(".contrib-undo").addEventListener("click", () => undoCandidateEdits(layer));
+      });
+    }
+
+    function undoCandidateEdits(layer) {
+      if (!layer._originalGeometry) return;
+      if (!layer._edited) {
+        toast("Nothing to undo — polygon is unchanged.", "info");
+        return;
+      }
+      // Mutating an L.Polygon's latlngs while leaflet-draw is editing it
+      // leaves stale vertex markers around — they end up "ghost" anchored to
+      // the dragged positions, and subsequent edits don't re-project because
+      // the marker group and the polygon's _rings disagree on which array
+      // owns the coordinates. The reliable fix is to throw the layer away
+      // and rebuild it from the original feature.
+      const originalFeature = {
+        type: "Feature",
+        geometry: JSON.parse(JSON.stringify(layer._originalGeometry)),
+        properties: layer._feature.properties || {},
+      };
+
+      // Tear down old layer
+      if (layer.editing && layer.editing._enabled) {
+        try { layer.editing.disable(); } catch {}
+      }
+      selectedCandidates.delete(layer);
+      candidatesLayer.removeLayer(layer);
+      if (activeEditLayer === layer) activeEditLayer = null;
+      hideEditorPanel();
+
+      // Build a fresh one in its place
+      const fresh = L.geoJSON(originalFeature, { style: STYLE_CANDIDATE }).getLayers()[0];
+      attachCandidateBehaviour(originalFeature, fresh);
+      candidatesLayer.addLayer(fresh);
+
+      // Re-open the editor on the new layer so the workflow is continuous
+      openCandidateEditor(fresh);
+
+      toast("Reverted to original Overture geometry.", "info");
+    }
+
+    function cancelCandidate(layer) {
+      if (layer && layer.editing) layer.editing.disable();
+      if (layer) {
+        try { layer.setStyle(STYLE_CANDIDATE); } catch {}
+      }
+      hideEditorPanel();
+      activeEditLayer = null;
+    }
+
+    async function approveCandidate(layer) {
+      if (layer.editing) layer.editing.disable();
+      const feature = {
+        type: "Feature",
+        geometry: layer.toGeoJSON().geometry,
+        properties: {},
+      };
+      const props = layer._feature.properties || {};
+      const body = {
+        feature,
+        source: "overture",
+        original_id: props.id ? String(props.id) : null,
+        edited: !!layer._edited,
+        // Snapshot the pre-edit Overture geometry so a later delete can
+        // restore the polygon back to the candidate layer for re-editing.
+        original_geometry: layer._originalGeometry || null,
+      };
+      try {
+        const res = await fetch(`${API_BASE}/contribute/contributions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const saved = await res.json();
+        // Move from candidates layer to approved layer
+        candidatesLayer.removeLayer(layer);
+        addApprovedFeature(saved);
+        updateApproveAllButton();
+        document.getElementById("stat-candidates").textContent = `Candidates: ${countCandidates()}`;
+        toast(`Saved ${saved.properties.area_sqm.toFixed(1)} m² ${layer._edited ? "(edited)" : ""}`, "success");
+        // Await so a fast ✕ click after Add can still find the contribution
+        // in _lastContributions and trigger candidate restoration.
+        await refreshContributions();
+      } catch (err) {
+        // Re-style as candidate so user can retry
+        layer.setStyle(STYLE_CANDIDATE);
+        toast(`Save failed: ${err.message}`, "error");
+        console.error(err);
+      } finally {
+        hideEditorPanel();
+        activeEditLayer = null;
+      }
+    }
+
+    function openSavePopup(layer, feature, { source, original_id, edited }) {
+      const html = `
+        <div class="flex items-start justify-between">
+          <div class="font-semibold text-slate-100 text-sm">
+            ${source === "manual" ? "Manual polygon" : "Edited candidate"}
+          </div>
+          <button class="contrib-cancel text-slate-500 hover:text-slate-200 text-lg leading-none -mt-1 -mr-1"
+            title="Discard">×</button>
+        </div>
+        <div class="text-slate-400 text-[11px]">
+          vertices: ${feature.geometry.coordinates[0].length - 1}
+        </div>
+        <div class="text-slate-500 text-[10px] leading-tight">
+          Review the shape on the map. Click Add to save, × to discard.
+        </div>
+        <div class="flex gap-1.5 pt-1">
+          <button class="contrib-add flex-1 bg-emerald-600 hover:bg-emerald-500 rounded px-2 py-1.5 text-white text-xs font-medium">
+            Add
+          </button>
+        </div>
+      `;
+      showEditorPanel(html, (root) => {
+        root.querySelector(".contrib-add").addEventListener("click", async () => {
+          try {
+            const res = await fetch(`${API_BASE}/contribute/contributions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ feature, source, original_id, edited }),
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.detail || `HTTP ${res.status}`);
+            }
+            const saved = await res.json();
+            drawnItems.removeLayer(layer);
+            addApprovedFeature(saved);
+            toast(`Saved ${saved.properties.area_sqm.toFixed(1)} m²`, "success");
+            refreshContributions();
+          } catch (err) {
+            toast(`Save failed: ${err.message}`, "error");
+          } finally {
+            hideEditorPanel();
+          }
+        });
+        root.querySelector(".contrib-cancel").addEventListener("click", () => {
+          drawnItems.removeLayer(layer);
+          hideEditorPanel();
+        });
+      });
+    }
+
+    // ---------------------------------------------------------------
+    // Approved contributions (load + render + list)
+    // ---------------------------------------------------------------
+    function addApprovedFeature(feature) {
+      L.geoJSON(feature, { style: STYLE_APPROVED }).eachLayer(l => {
+        l._feature = feature;
+        l._approvedId = feature.properties.id;
+        l.bindTooltip(
+          `id: ${feature.properties.id.slice(0, 12)}<br/>area: ${feature.properties.area_sqm.toFixed(1)} m²`,
+          { sticky: true, direction: "top", className: "text-xs" },
+        );
+        l.on("click", () => {
+          if (approvedSelectMode) toggleApprovedSelection(l);
+          else map.fitBounds(l.getBounds(), { maxZoom: 19, padding: [40, 40] });
+        });
+        approvedLayer.addLayer(l);
+      });
+    }
+
+    function toggleApprovedSelection(layer) {
+      if (selectedApproved.has(layer)) {
+        selectedApproved.delete(layer);
+        layer.setStyle(STYLE_APPROVED);
+      } else {
+        selectedApproved.add(layer);
+        layer.setStyle(STYLE_APPROVED_SELECTED);
+      }
+      updateApprovedSelectionBtn();
+      // Mirror to the sidebar row state
+      renderContributionList(_lastContributions);
+    }
+
+    function clearApprovedSelection() {
+      selectedApproved.forEach(l => { try { l.setStyle(STYLE_APPROVED); } catch {} });
+      selectedApproved.clear();
+      updateApprovedSelectionBtn();
+      renderContributionList(_lastContributions);
+    }
+
+    function updateApprovedSelectionBtn() {
+      const btn = document.getElementById("apr-delete-selected-btn");
+      const n = selectedApproved.size;
+      btn.disabled = n === 0;
+      btn.textContent = `Delete selected (${n})`;
+    }
+
+    function toggleApprovedSelectMode() {
+      approvedSelectMode = !approvedSelectMode;
+      const toggle = document.getElementById("apr-select-toggle");
+      const sel = document.getElementById("apr-delete-selected-btn");
+      if (approvedSelectMode) {
+        toggle.textContent = "Exit select mode";
+        toggle.classList.remove("bg-slate-800", "hover:bg-slate-700", "border-slate-700", "text-slate-200");
+        toggle.classList.add("bg-rose-700", "hover:bg-rose-600", "border-rose-600", "text-white");
+        sel.classList.remove("hidden");
+      } else {
+        clearApprovedSelection();
+        toggle.textContent = "Select mode";
+        toggle.classList.add("bg-slate-800", "hover:bg-slate-700", "border-slate-700", "text-slate-200");
+        toggle.classList.remove("bg-rose-700", "hover:bg-rose-600", "border-rose-600", "text-white");
+        sel.classList.add("hidden");
+      }
+      renderContributionList(_lastContributions);
+    }
+
+    async function deleteSelectedApproved() {
+      if (!selectedApproved.size) return;
+      const ids = [...selectedApproved].map(l => l._approvedId).filter(Boolean);
+      if (!ids.length) return;
+      // Snapshot which of the doomed contributions can be restored to the
+      // candidate layer so the user can re-edit them. Uses the same robust
+      // lookup as single-delete so a race with refreshContributions can't
+      // hide them.
+      const restorable = ids
+        .map(findContributionById)
+        .filter(c => c && contributionRestorable(c));
+      const restorableNote = restorable.length
+        ? `\n\n${restorable.length} were Overture-sourced and will return to the orange candidate layer for re-editing.`
+        : "";
+      if (!confirm(`Delete ${ids.length} selected contribution(s)?${restorableNote}`)) return;
+      await bulkDelete(ids, restorable);
+      if (approvedSelectMode) toggleApprovedSelectMode();
+    }
+
+    async function deleteAllApproved() {
+      const count = (_lastContributions || []).length;
+      if (!count) {
+        toast("No contributions to delete.", "info");
+        return;
+      }
+      // Snapshot every Overture-sourced contribution so we can restore them
+      // to the candidate layer after the wipe — same UX as single/selected
+      // delete. Manual-source contributions stay deleted.
+      const restorable = (_lastContributions || []).filter(contributionRestorable);
+      const restorableNote = restorable.length
+        ? `\n\n${restorable.length} were Overture-sourced and will return to the orange candidate layer for re-editing.`
+        : "";
+      if (!confirm(`Delete ALL ${count} contribution(s)?${restorableNote}`)) return;
+      document.getElementById("loading").classList.remove("hidden");
+      document.getElementById("loading-text").textContent = `Deleting ${count}…`;
+      try {
+        const res = await fetch(
+          `${API_BASE}/contribute/contributions?confirm=true`,
+          { method: "DELETE" },
+        );
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const result = await res.json();
+        restorable.forEach(restoreCandidateFromContribution);
+        const restoredNote = restorable.length ? ` ${restorable.length} restored as candidates.` : "";
+        toast(`Deleted ${result.deleted_count}.${restoredNote}`, "success");
+        selectedApproved.clear();
+        await refreshContributions();
+      } catch (err) {
+        toast(`Delete-all failed: ${err.message}`, "error");
+      } finally {
+        document.getElementById("loading").classList.add("hidden");
+      }
+    }
+
+    async function bulkDelete(ids, restorable) {
+      restorable = restorable || [];
+      document.getElementById("loading").classList.remove("hidden");
+      document.getElementById("loading-text").textContent = `Deleting ${ids.length}…`;
+      try {
+        const res = await fetch(`${API_BASE}/contribute/contributions/bulk-delete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const result = await res.json();
+        restorable.forEach(restoreCandidateFromContribution);
+        const kind = result.missing_count ? "info" : "success";
+        const restoredNote = restorable.length ? ` ${restorable.length} restored as candidates.` : "";
+        const summary = result.missing_count
+          ? `Deleted ${result.deleted_count}, ${result.missing_count} not found.${restoredNote}`
+          : `Deleted ${result.deleted_count}.${restoredNote}`;
+        toast(summary, kind);
+        selectedApproved.clear();
+        await refreshContributions();
+      } catch (err) {
+        toast(`Bulk delete failed: ${err.message}`, "error");
+        console.error(err);
+      } finally {
+        document.getElementById("loading").classList.add("hidden");
+      }
+    }
+
+    let _lastContributions = [];
+
+    async function refreshContributions() {
+      try {
+        const res = await fetch(`${API_BASE}/contribute/contributions`);
+        const data = await res.json();
+        approvedLayer.clearLayers();
+        for (const f of data.features || []) {
+          addApprovedFeature(f);
+        }
+        // Any selections still alive on the new layers get re-applied;
+        // anything pointing at a layer that no longer exists is dropped.
+        const validIds = new Set((data.features || []).map(f => f.properties.id));
+        for (const l of [...selectedApproved]) {
+          if (!l._approvedId || !validIds.has(l._approvedId)) selectedApproved.delete(l);
+        }
+        // Restyle remaining selected layers (new layer instances) by id match.
+        if (selectedApproved.size) {
+          const wantedIds = new Set([...selectedApproved].map(l => l._approvedId));
+          selectedApproved.clear();
+          approvedLayer.eachLayer(l => {
+            if (l._approvedId && wantedIds.has(l._approvedId)) {
+              selectedApproved.add(l);
+              l.setStyle(STYLE_APPROVED_SELECTED);
+            }
+          });
+        }
+        _lastContributions = data.features || [];
+        renderContributionList(_lastContributions);
+        document.getElementById("stat-approved").textContent = `Approved: ${_lastContributions.length}`;
+        document.getElementById("contrib-count").textContent = _lastContributions.length;
+        document.getElementById("apr-delete-all-btn").disabled = _lastContributions.length === 0;
+        updateApprovedSelectionBtn();
+      } catch (err) {
+        toast(`Could not load contributions: ${err.message}`, "error");
+      }
+    }
+
+    function renderContributionList(items) {
+      const list = document.getElementById("contrib-list");
+      if (!items.length) {
+        list.innerHTML = '<div class="text-[11px] italic text-slate-600">No contributions yet.</div>';
+        return;
+      }
+      const selectedIds = new Set([...selectedApproved].map(l => l._approvedId));
+      list.innerHTML = items
+        .map(f => {
+          const p = f.properties || {};
+          const id = (p.id || "").slice(0, 8);
+          const area = (p.area_sqm || 0).toFixed(0);
+          const when = new Date(p.created_at || Date.now()).toLocaleString();
+          const tag = p.source === "manual" ? "M" : (p.edited ? "E" : "O");
+          const tagColor = p.source === "manual" ? "bg-purple-700"
+                          : p.edited ? "bg-amber-700" : "bg-orange-700";
+          const isSelected = selectedIds.has(p.id);
+          const rowBg = isSelected
+            ? "bg-amber-900/30 border border-amber-600/50"
+            : "border border-transparent";
+          const action = approvedSelectMode
+            ? `onclick="toggleApprovedSelectionById('${p.id}')"`
+            : `onclick="flyToContribution('${p.id}')"`;
+          const checkMark = approvedSelectMode
+            ? `<span class="inline-block w-3 h-3 mr-1 rounded-sm border ${isSelected ? 'bg-amber-400 border-amber-300' : 'border-slate-500'}"></span>`
+            : "";
+          return `
+            <div class="contrib-row flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer ${rowBg}"
+                 ${action}>
+              ${checkMark}
+              <span class="inline-block w-5 text-center text-[10px] font-semibold rounded ${tagColor} text-white">${tag}</span>
+              <div class="flex-1 min-w-0">
+                <div class="text-slate-200 text-xs truncate">${area} m² · <code class="text-slate-500">${id}</code></div>
+                <div class="text-[10px] text-slate-500">${when}</div>
+              </div>
+              <button onclick="event.stopPropagation(); deleteContribution('${p.id}')"
+                class="text-slate-500 hover:text-rose-400 text-xs px-1">✕</button>
+            </div>
+          `;
+        })
+        .join("");
+    }
+
+    function toggleApprovedSelectionById(id) {
+      approvedLayer.eachLayer(l => {
+        if (l._approvedId === id) toggleApprovedSelection(l);
+      });
+    }
+
+    function flyToContribution(id) {
+      let target = null;
+      approvedLayer.eachLayer(l => {
+        const props = l.feature?.properties || {};
+        if (props.id === id) target = l;
+      });
+      if (target) {
+        map.fitBounds(target.getBounds(), { maxZoom: 19, padding: [40, 40] });
+      }
+    }
+
+    function findContributionById(id) {
+      // 1) Primary source: the snapshot from the last list-contributions
+      //    fetch (always has properties.original_geometry when present).
+      const fromCache = _lastContributions.find(c => (c.properties || {}).id === id);
+      if (fromCache) return fromCache;
+      // 2) Fallback: the approved layer itself stores the full Feature on
+      //    each polygon. Covers the race window between approve + refresh.
+      let fromLayer = null;
+      approvedLayer.eachLayer(l => {
+        if (l._feature && (l._feature.properties || {}).id === id) fromLayer = l._feature;
+      });
+      return fromLayer;
+    }
+
+    async function deleteContribution(id) {
+      // Look up the contribution before deleting so we can restore the
+      // original Overture candidate to the orange layer if appropriate.
+      const contrib = findContributionById(id);
+      const canRestore = !!contrib && contributionRestorable(contrib);
+      const msg = canRestore
+        ? "Delete this contribution? The original Overture candidate will come back to the orange layer so you can edit and re-approve."
+        : "Delete this contribution? This can't be undone.";
+      if (!confirm(msg)) return;
+      try {
+        const res = await fetch(`${API_BASE}/contribute/contributions/${id}`, { method: "DELETE" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (canRestore) restoreCandidateFromContribution(contrib);
+        toast(canRestore ? "Deleted — restored as candidate." : "Deleted.", "success");
+        await refreshContributions();
+      } catch (err) {
+        toast(`Delete failed: ${err.message}`, "error");
+      }
+    }
+
+    function restorableGeometryFor(contrib) {
+      const p = contrib.properties || {};
+      if (p.source !== "overture") return null;
+      // Prefer the pre-edit Overture snapshot — that's the truly "original".
+      if (p.original_geometry && p.original_geometry.type === "Polygon") {
+        return p.original_geometry;
+      }
+      // Fallback: the saved geometry (possibly user-edited). Better to
+      // bring the polygon back so the user can re-edit than to lose it.
+      if (contrib.geometry && contrib.geometry.type === "Polygon") {
+        return contrib.geometry;
+      }
+      return null;
+    }
+
+    function contributionRestorable(contrib) {
+      return !!restorableGeometryFor(contrib);
+    }
+
+    function restoreCandidateFromContribution(contrib) {
+      const geom = restorableGeometryFor(contrib);
+      if (!geom) return;
+      const p = contrib.properties || {};
+      const vertexCount = (geom.coordinates[0] || []).length - 1;
+      const restoredId = p.original_id || `restored-${contrib.id}`;
+      const feature = {
+        type: "Feature",
+        id: restoredId,
+        geometry: geom,
+        properties: {
+          id: restoredId,
+          source: "overture",
+          // No recompute — the editor panel tolerates missing area_sqm.
+          area_sqm: undefined,
+          vertex_count: vertexCount,
+          layer: "overture-candidate",
+        },
+      };
+      const layer = L.geoJSON(feature, { style: STYLE_CANDIDATE }).getLayers()[0];
+      attachCandidateBehaviour(feature, layer);
+      candidatesLayer.addLayer(layer);
+      // Make sure the candidates layer is visible — easy to miss otherwise.
+      if (!map.hasLayer(candidatesLayer)) {
+        map.addLayer(candidatesLayer);
+        const cb = document.getElementById("layer-candidates");
+        if (cb) cb.checked = true;
+      }
+      updateApproveAllButton();
+      document.getElementById("stat-candidates").textContent = `Candidates: ${countCandidates()}`;
+    }
+
+    function exportGeoJson() {
+      window.location.href = `${API_BASE}/contribute/contributions/export.geojson`;
+    }
+
+    // ---------------------------------------------------------------
+    // Init
+    // ---------------------------------------------------------------
+    refreshContributions();
+  </script>
+</body>
+</html>
