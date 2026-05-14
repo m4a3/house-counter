@@ -5,12 +5,14 @@ import io
 import math
 import os
 import time
-from typing import List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 # Platform-aware font discovery
 _FONT_SEARCH_PATHS = [
@@ -162,6 +164,75 @@ def estimate_processing_time(grid_size: int) -> str:
         return f"~{seconds/3600:.1f} hours"
 
 
+def _building_union(buildings: Optional[List[dict]]):
+    """Unary-union all buildings into a single shapely geometry.
+
+    Input dicts have ``coordinates`` as ``[(lat, lon), ...]`` rings. Returns
+    ``None`` if the input is empty or no valid polygons could be built.
+    """
+    if not buildings:
+        return None
+    polys = []
+    for b in buildings:
+        coords = b.get("coordinates", [])
+        if len(coords) < 3:
+            continue
+        ring = [(lon, lat) for lat, lon in coords]
+        try:
+            p = Polygon(ring)
+            if not p.is_valid:
+                p = p.buffer(0)
+            if p.is_valid and not p.is_empty:
+                polys.append(p)
+        except Exception:
+            continue
+    if not polys:
+        return None
+    try:
+        return unary_union(polys)
+    except Exception:
+        return None
+
+
+def _draw_geometry(
+    region,
+    draw: ImageDraw.ImageDraw,
+    to_pixel: Callable[[float, float], Tuple[int, int]],
+    fill: Tuple[int, int, int, int],
+    outline: Tuple[int, int, int, int],
+):
+    """Rasterise a shapely Polygon/MultiPolygon/GeometryCollection."""
+    if region is None or region.is_empty:
+        return
+
+    geoms = []
+    if region.geom_type == "Polygon":
+        geoms = [region]
+    elif region.geom_type == "MultiPolygon":
+        geoms = list(region.geoms)
+    elif region.geom_type == "GeometryCollection":
+        for g in region.geoms:
+            if g.geom_type == "Polygon":
+                geoms.append(g)
+            elif g.geom_type == "MultiPolygon":
+                geoms.extend(g.geoms)
+    else:
+        return
+
+    for poly in geoms:
+        exterior_px = [to_pixel(lat, lon) for lon, lat in poly.exterior.coords]
+        if len(exterior_px) < 3:
+            continue
+        draw.polygon(exterior_px, fill=fill, outline=outline)
+        # Building polygons rarely have interior rings; if they do, punch
+        # the hole back through with a fully-transparent fill so the
+        # underlying tile shows.
+        for interior in poly.interiors:
+            hole_px = [to_pixel(lat, lon) for lon, lat in interior.coords]
+            if len(hole_px) >= 3:
+                draw.polygon(hole_px, fill=(0, 0, 0, 0), outline=outline)
+
+
 def fetch_tile(x: int, y: int, zoom: int) -> Tuple[int, int, Image.Image | None]:
     """Fetch a single Google Maps tile. Returns (x, y, image)."""
     url = GOOGLE_TILE_URL.format(x=x, y=y, z=zoom)
@@ -229,20 +300,26 @@ def create_map_image(
     buildings: List[dict],
     tile_size: int = 256,
     grid_size: int = 5,
-    zoom: Optional[int] = None
+    zoom: Optional[int] = None,
+    osm_buildings: Optional[List[dict]] = None,
 ) -> Image.Image:
     """
     Create a map image with Google Tiles background and building markers.
-    
+
     Args:
         center_lat: Center latitude
         center_lon: Center longitude
         radius_meters: Radius in meters
-        buildings: List of building dicts with 'coordinates' and 'center'
+        buildings: Microsoft/Overture building dicts with 'coordinates' and 'center'.
+            Drawn in red.
         tile_size: Size of each tile (default 256)
         grid_size: Number of tiles in each direction (default 5, auto-calculated if zoom is specified)
         zoom: Optional zoom level override (default: auto-calculated based on radius)
-    
+        osm_buildings: Optional second list of building dicts to overlay in blue.
+            Same shape as ``buildings``. When provided, the info box and legend
+            also show OSM coverage so blind spots (red-only areas) and
+            shape mismatches (red vs. blue outlines) are easy to spot.
+
     Returns:
         PIL Image with map and overlays
     """
@@ -319,31 +396,91 @@ def create_map_image(
         width=circle_width
     )
     
-    # Draw building polygons
-    print(f"Drawing {len(buildings)} building polygons...")
-    for building in buildings:
-        coords = building.get("coordinates", [])
-        if len(coords) < 3:
-            continue
-            
-        # Convert to pixel coordinates
-        pixel_coords = []
-        for lat, lon in coords:
-            px, py = lat_lon_to_pixel(lat, lon, start_tile_x, start_tile_y, zoom, tile_size)
-            pixel_coords.append((px, py))
-        
-        # Draw filled polygon
-        draw.polygon(pixel_coords, fill=(255, 0, 0, 100), outline=(255, 0, 0, 255))
+    osm_count = len(osm_buildings) if osm_buildings else 0
+
+    def _to_pixel(lat: float, lon: float) -> Tuple[int, int]:
+        return lat_lon_to_pixel(lat, lon, start_tile_x, start_tile_y, zoom, tile_size)
+
+    if osm_buildings is not None:
+        # Set-difference overlay: green where both sources agree, red where
+        # only MS has a building (OSM blind spot), blue where only OSM has it.
+        print(
+            f"Computing overlap regions for {len(buildings)} MS vs "
+            f"{osm_count} OSM polygons..."
+        )
+        t_union = time.time()
+        ms_union = _building_union(buildings)
+        osm_union = _building_union(osm_buildings)
+        print(f"  unions built in {time.time() - t_union:.1f}s")
+
+        if ms_union is not None and osm_union is not None:
+            t_ops = time.time()
+            try:
+                agreement = ms_union.intersection(osm_union)
+            except Exception:
+                agreement = None
+            try:
+                ms_only = ms_union.difference(osm_union)
+            except Exception:
+                ms_only = ms_union
+            try:
+                osm_only = osm_union.difference(ms_union)
+            except Exception:
+                osm_only = osm_union
+            print(f"  set operations done in {time.time() - t_ops:.1f}s")
+        else:
+            agreement = None
+            ms_only = ms_union
+            osm_only = osm_union
+
+        # Draw agreement first so its outline isn't overwritten by the
+        # red / blue diff regions (which are disjoint anyway).
+        _draw_geometry(
+            agreement, draw, _to_pixel,
+            fill=(0, 255, 60, 140), outline=(0, 230, 30, 255),
+        )
+        _draw_geometry(
+            ms_only, draw, _to_pixel,
+            fill=(255, 0, 0, 140), outline=(255, 0, 0, 255),
+        )
+        _draw_geometry(
+            osm_only, draw, _to_pixel,
+            fill=(0, 150, 255, 140), outline=(0, 150, 255, 255),
+        )
+    else:
+        # Single-source rendering (no OSM overlay) — preserve original red.
+        print(f"Drawing {len(buildings)} building polygons...")
+        for building in buildings:
+            coords = building.get("coordinates", [])
+            if len(coords) < 3:
+                continue
+
+            pixel_coords = []
+            for lat, lon in coords:
+                px, py = _to_pixel(lat, lon)
+                pixel_coords.append((px, py))
+
+            draw.polygon(
+                pixel_coords,
+                fill=(255, 0, 0, 100), outline=(255, 0, 0, 255),
+            )
     
-    # Draw center marker
+    # Draw center marker. When the OSM overlay is active, switch to magenta
+    # so it can't be mistaken for the "both sources agree" green regions.
     marker_size = max(8, actual_grid_size // 5)
+    if osm_buildings is not None:
+        marker_fill = (255, 0, 255, 255)
+        marker_outline = (120, 0, 120, 255)
+    else:
+        marker_fill = (0, 255, 0, 255)
+        marker_outline = (0, 100, 0, 255)
     draw.ellipse(
         [
             center_px - marker_size, center_py - marker_size,
-            center_px + marker_size, center_py + marker_size
+            center_px + marker_size, center_py + marker_size,
         ],
-        fill=(0, 255, 0, 255),
-        outline=(0, 100, 0, 255)
+        fill=marker_fill,
+        outline=marker_outline,
     )
     
     # Add text overlay with count
@@ -357,36 +494,104 @@ def create_map_image(
     overlay = Image.new("RGBA", composite.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
     
-    # Draw info box (scaled with image size)
-    box_width = max(320, img_width // 4)
-    box_height = max(120, img_height // 10)
+    # Draw info box (scaled with image size) — taller when OSM is overlaid
+    box_width = max(360, img_width // 4)
+    info_lines = 3 if osm_buildings is None else 4
+    box_height = max(120, img_height // 10) + (small_font_size + 6 if osm_buildings else 0)
     box_padding = max(15, img_width // 80)
     box_x, box_y = 20, 20
-    
+
     overlay_draw.rectangle(
         [box_x, box_y, box_x + box_width, box_y + box_height],
         fill=(0, 0, 0, 180)
     )
-    
-    info_text = f"Buildings Found: {len(buildings)}"
+
+    ms_label = "MS Buildings" if osm_buildings is not None else "Buildings Found"
+    info_text = f"{ms_label}: {len(buildings)}"
     coord_text = f"Center: {center_lat:.6f}, {center_lon:.6f}"
     radius_text = f"Radius: {radius_meters/1000:.1f} km | Zoom: {zoom}"
-    
-    overlay_draw.text((box_x + box_padding, box_y + box_padding), info_text, fill=(255, 255, 255), font=font)
-    overlay_draw.text((box_x + box_padding, box_y + box_padding + font_size + 5), coord_text, fill=(200, 200, 200), font=small_font)
-    overlay_draw.text((box_x + box_padding, box_y + box_padding + font_size + small_font_size + 10), radius_text, fill=(200, 200, 200), font=small_font)
-    
-    # Legend (scaled)
-    legend_height = max(60, img_height // 15)
-    legend_width = max(200, img_width // 6)
+
+    ty = box_y + box_padding
+    overlay_draw.text((box_x + box_padding, ty), info_text, fill=(255, 255, 255), font=font)
+    ty += font_size + 5
+    if osm_buildings is not None:
+        osm_text = f"OSM Buildings: {osm_count}"
+        overlay_draw.text((box_x + box_padding, ty), osm_text, fill=(180, 220, 255), font=small_font)
+        ty += small_font_size + 5
+    overlay_draw.text((box_x + box_padding, ty), coord_text, fill=(200, 200, 200), font=small_font)
+    ty += small_font_size + 5
+    overlay_draw.text((box_x + box_padding, ty), radius_text, fill=(200, 200, 200), font=small_font)
+
+    # Legend (scaled) — extra rows when both sources are overlaid
+    legend_rows = 4 if osm_buildings is not None else 2
+    legend_height = max(60, img_height // 15) + (
+        (small_font_size + 6) * 2 if osm_buildings is not None else 0
+    )
+    legend_width = max(280, img_width // 5)
     legend_y = img_height - legend_height - 20
-    overlay_draw.rectangle([20, legend_y, 20 + legend_width, legend_y + legend_height], fill=(0, 0, 0, 180))
-    
-    icon_size = max(10, legend_height // 4)
-    overlay_draw.rectangle([35, legend_y + icon_size, 35 + icon_size, legend_y + icon_size * 2], fill=(255, 0, 0, 150), outline=(255, 0, 0))
-    overlay_draw.text((50 + icon_size, legend_y + icon_size - 3), "Building", fill=(255, 255, 255), font=small_font)
-    overlay_draw.ellipse([35, legend_y + icon_size * 3, 35 + icon_size, legend_y + icon_size * 4], fill=(0, 255, 0), outline=(0, 100, 0))
-    overlay_draw.text((50 + icon_size, legend_y + icon_size * 3 - 3), "Center Point", fill=(255, 255, 255), font=small_font)
+    overlay_draw.rectangle(
+        [20, legend_y, 20 + legend_width, legend_y + legend_height],
+        fill=(0, 0, 0, 180),
+    )
+
+    icon_size = max(10, legend_height // (legend_rows * 2))
+    row_y = legend_y + icon_size
+
+    if osm_buildings is not None:
+        overlay_draw.rectangle(
+            [35, row_y, 35 + icon_size, row_y + icon_size],
+            fill=(0, 255, 60, 180), outline=(0, 230, 30),
+        )
+        overlay_draw.text(
+            (50 + icon_size, row_y - 3),
+            "Both sources agree", fill=(255, 255, 255), font=small_font,
+        )
+        row_y += icon_size * 2
+
+        overlay_draw.rectangle(
+            [35, row_y, 35 + icon_size, row_y + icon_size],
+            fill=(255, 0, 0, 180), outline=(255, 0, 0),
+        )
+        overlay_draw.text(
+            (50 + icon_size, row_y - 3),
+            "MS / Overture only", fill=(255, 255, 255), font=small_font,
+        )
+        row_y += icon_size * 2
+
+        overlay_draw.rectangle(
+            [35, row_y, 35 + icon_size, row_y + icon_size],
+            fill=(0, 150, 255, 180), outline=(0, 150, 255),
+        )
+        overlay_draw.text(
+            (50 + icon_size, row_y - 3),
+            "OSM only", fill=(255, 255, 255), font=small_font,
+        )
+        row_y += icon_size * 2
+    else:
+        overlay_draw.rectangle(
+            [35, row_y, 35 + icon_size, row_y + icon_size],
+            fill=(255, 0, 0, 150), outline=(255, 0, 0),
+        )
+        overlay_draw.text(
+            (50 + icon_size, row_y - 3),
+            "MS / Overture Building", fill=(255, 255, 255), font=small_font,
+        )
+        row_y += icon_size * 2
+
+    if osm_buildings is not None:
+        center_fill = (255, 0, 255)
+        center_outline = (120, 0, 120)
+    else:
+        center_fill = (0, 255, 0)
+        center_outline = (0, 100, 0)
+    overlay_draw.ellipse(
+        [35, row_y, 35 + icon_size, row_y + icon_size],
+        fill=center_fill, outline=center_outline,
+    )
+    overlay_draw.text(
+        (50 + icon_size, row_y - 3),
+        "Center Point", fill=(255, 255, 255), font=small_font,
+    )
     
     # Composite the overlay
     composite = Image.alpha_composite(composite.convert("RGBA"), overlay)

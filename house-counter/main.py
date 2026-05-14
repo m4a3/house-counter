@@ -339,20 +339,35 @@ async def compare_with_map(
     lat: float = Query(..., description="Latitude of center point", ge=-90, le=90),
     lon: float = Query(..., description="Longitude of center point", ge=-180, le=180),
     radius_km: float = Query(1.0, description="Search radius in kilometers", gt=0, le=10),
-    zoom: Optional[int] = Query(None, description="Zoom level (14-18)", ge=10, le=18)
+    zoom: Optional[int] = Query(None, description="Zoom level (14-18)", ge=10, le=18),
+    output_path: Optional[str] = Query(None, description="Path to save the map image"),
+    osm_all_buildings: bool = Query(
+        True,
+        description=(
+            "When true (default) fetch every OSM ``building=*`` polygon so blind "
+            "spots in non-residential zones show up. When false, restrict OSM to "
+            "residential types to mirror the /compare count methodology."
+        ),
+    ),
 ):
     """
-    Compare data sources and generate a map showing buildings from both sources.
-    
-    Buildings are color-coded:
-    - Red: Microsoft Building Footprints
-    - Blue: OpenStreetMap buildings
+    Compare data sources and generate a map overlaying buildings from both.
+
+    The overlay is built from polygon set operations so each pixel belongs
+    to exactly one region:
+
+    - Green:  ``MS ∩ OSM`` — both sources agree this is a building
+    - Red:    ``MS − OSM`` — Microsoft / Overture only (OSM blind spot)
+    - Blue:   ``OSM − MS`` — OSM only (Microsoft missed it)
+
+    The relative areas of red vs. green tell you roughly how complete OSM is
+    over the queried radius; mismatched red/blue edges along the same
+    building reveal footprint-shape disagreements between the two sources.
     """
     radius_meters = radius_km * 1000
     actual_zoom = zoom if zoom else calculate_zoom_for_radius(radius_meters)
     loop = asyncio.get_event_loop()
-    
-    # Get buildings from both sources concurrently
+
     async def query_ms():
         buildings, _ = await loop.run_in_executor(
             executor, query_ms_buildings_in_radius, lat, lon, radius_meters
@@ -361,57 +376,74 @@ async def compare_with_map(
             executor, get_building_polygons_ms, lat, lon, radius_meters
         )
         return buildings, polygons
-    
+
     async def query_osm():
         return await loop.run_in_executor(
-            executor, get_osm_building_polygons, lat, lon, radius_meters
+            executor,
+            get_osm_building_polygons,
+            lat, lon, radius_meters, osm_all_buildings,
         )
-    
+
     ms_task = asyncio.create_task(query_ms())
     osm_task = asyncio.create_task(query_osm())
-    
+
     try:
         ms_buildings, ms_polygons = await ms_task
     except Exception:
         ms_polygons = []
         ms_buildings = []
-    
+
     try:
         osm_polygons = await osm_task
     except Exception:
         osm_polygons = []
-    
-    # Create base map with Microsoft buildings (red)
-    # Note: OSM overlay would require coordinate translation to image pixels
-    # which is complex - for now we just show Microsoft buildings on the map
+
     img = await loop.run_in_executor(
-        executor, lambda: create_map_image(lat, lon, radius_meters, ms_polygons, zoom=zoom)
+        executor,
+        lambda: create_map_image(
+            lat, lon, radius_meters, ms_polygons,
+            zoom=zoom, osm_buildings=osm_polygons,
+        ),
     )
-    
-    # Save map
-    filename = f"compare_map_{lat}_{lon}_{radius_km}km.png"
-    img.save(filename, format="PNG")
-    saved_path = os.path.abspath(filename)
-    
+
+    if output_path:
+        img.save(output_path, format="PNG")
+        saved_path = os.path.abspath(output_path)
+    else:
+        zoom_suffix = f"_z{actual_zoom}" if zoom else ""
+        filename = f"compare_map_{lat}_{lon}_{radius_km}km{zoom_suffix}.png"
+        img.save(filename, format="PNG")
+        saved_path = os.path.abspath(filename)
+
     ms_count = len(ms_buildings)
     osm_count = len(osm_polygons)
-    
+
     if ms_count > 0 and osm_count > 0:
         difference = ms_count - osm_count
         difference_pct = round((difference / osm_count) * 100, 1)
-        comparison = f"Microsoft found {difference:+d} more buildings ({difference_pct:+.1f}%)"
+        comparison = (
+            f"Microsoft found {difference:+d} more buildings ({difference_pct:+.1f}%)"
+        )
     else:
         comparison = f"Microsoft: {ms_count}, OSM: {osm_count}"
-    
+
     return {
         "latitude": lat,
         "longitude": lon,
         "radius_km": radius_km,
+        "zoom": actual_zoom,
         "microsoft_count": ms_count,
         "osm_count": osm_count,
+        "osm_all_buildings": osm_all_buildings,
         "comparison": comparison,
         "map_saved": saved_path,
-        "note": "Map shows Microsoft buildings (red). OSM comparison is count-only."
+        "legend": {
+            "green": "Both sources agree (MS ∩ OSM)",
+            "red": "MS / Overture only (MS − OSM) — OSM blind spot",
+            "blue": "OSM only (OSM − MS) — MS missed it",
+            "magenta_dot": "Query center point",
+            "yellow_circle": "Search radius",
+        },
     }
 
 
