@@ -1,6 +1,6 @@
 # House Counter API
 
-Count buildings within a given radius using Microsoft Building Footprints (ML-derived from satellite imagery), with optional map visualization using Google satellite tiles.
+Count buildings within a given radius using Microsoft Building Footprints (ML-derived from satellite imagery), with optional map visualization using Google satellite tiles. Also includes an OSM contributor UI for surfacing and filing OSM blind spots.
 
 ## Features
 
@@ -8,6 +8,7 @@ Count buildings within a given radius using Microsoft Building Footprints (ML-de
 - **No API Key Required**: All data sources are publicly accessible
 - **Visual Output**: Generate map images with Google satellite tiles as background
 - **Configurable Zoom**: Choose detail level for map output (trades speed for resolution)
+- **OSM Contributor UI**: Browser-based tool at `/contribute` for editing and saving OSM-missing buildings as GeoJSON
 
 ## Installation
 
@@ -17,7 +18,7 @@ Count buildings within a given radius using Microsoft Building Footprints (ML-de
 docker compose up --build
 ```
 
-The server runs on `http://localhost:8008`. Building data cache is persisted in a Docker volume.
+The server runs on `http://localhost:8008`. The Overture parquet cache and approved OSM contributions are persisted in named Docker volumes (`building_cache` and `contributions`) so both survive container rebuilds.
 
 To pass environment variables (e.g. `GOOGLE_TILES_API_KEY`), create a `.env` file in the project root before starting the container.
 
@@ -122,11 +123,42 @@ curl "http://localhost:8008/compare?lat=36.060345&lon=-95.816314&radius_km=3"
 
 ### `GET /compare-with-map`
 
-Compare counts and generate a map image.
+Compare counts and generate a map image with a polygon set-difference overlay so agreement vs blind spots is unambiguous:
+
+- **green** — MS ∩ OSM (both sources agree)
+- **red** — MS − OSM (OSM blind spot — Microsoft has the building but OSM doesn't)
+- **blue** — OSM − MS (MS missed it — OSM has the building but Microsoft doesn't)
 
 ```bash
 curl "http://localhost:8008/compare-with-map?lat=36.060345&lon=-95.816314&radius_km=3"
 ```
+
+## OSM Contributor UI
+
+A browser-based tool for fixing OSM blind spots without leaving the service. Browse to:
+
+```
+http://localhost:8008/contribute
+```
+
+Workflow: pan to an area, click **Detect** to load existing OSM buildings (blue) and Overture polygons that are not yet in OSM (orange candidates). Click a candidate to drag its vertices for a closer fit, or use **Approve all** to bulk-promote them. Approved polygons turn green and are persisted as one GeoJSON file per polygon under `contributions/`. **Export GeoJSON** downloads the full set as a single `FeatureCollection` ready to be reviewed and imported into OSM.
+
+Endpoints:
+
+| Method | Path | Behaviour |
+|---|---|---|
+| `GET` | `/contribute` | Serves the contributor UI |
+| `GET` | `/contribute/osm-buildings?lat&lon&radius_km` | Existing OSM buildings as a GeoJSON `FeatureCollection` |
+| `GET` | `/contribute/overture-candidates?lat&lon&radius_km&only_missing=true` | Overture polygons whose area is < 50 % already in OSM. `only_missing=false` returns every Overture polygon in the radius. |
+| `GET` | `/contribute/contributions` | List saved contributions newest-first + stats |
+| `POST` | `/contribute/contributions` | Validate + persist a single polygon |
+| `POST` | `/contribute/contributions/bulk` | Validate + persist many polygons in one round-trip |
+| `POST` | `/contribute/contributions/bulk-delete` | Remove many contributions in one call |
+| `DELETE` | `/contribute/contributions/{id}` | Remove one |
+| `DELETE` | `/contribute/contributions?confirm=true` | Remove every contribution |
+| `GET` | `/contribute/contributions/export.geojson` | Single merged `FeatureCollection`, `Content-Disposition: attachment` |
+
+Radius is capped at 3 km per call so a single Overpass / Overture round-trip stays under ~30 s on a typical link. The OSM lookup is cached in-memory for 5 minutes per `(lat, lon, radius, all_buildings)` tuple so repeated detection in the same area stays fast and survives short Overpass outages. When Overpass is unavailable the candidate endpoint still returns every Overture polygon in the radius with `meta.osm_available: false` so the UI can warn rather than 500.
 
 ## Zoom Levels
 

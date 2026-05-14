@@ -12,10 +12,15 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from cache_manager import get_cache_manager
+from contributor import (
+    ContributionError,
+    get_contribution_store,
+    overture_only_candidates,
+)
 from ms_buildings import query_ms_buildings_in_radius, get_building_polygons_ms, count_buildings_in_radius
 from osm_query import query_osm_buildings, get_osm_building_polygons
 from visualization import (
@@ -601,6 +606,316 @@ async def delete_cached_area(area_id: str):
 async def cache_stats():
     """Return aggregate cache statistics."""
     return _cache_mgr.get_stats()
+
+
+# ======================================================================
+# OSM Contributor Endpoints
+# ======================================================================
+_contribution_store = get_contribution_store()
+
+
+class ContributionPostRequest(BaseModel):
+    """POST body for creating a contribution."""
+
+    feature: Dict = Field(..., description="GeoJSON Feature with a Polygon geometry")
+    source: str = Field(
+        "overture",
+        description="Either 'overture' (started from a detected candidate) or 'manual' (drawn from scratch).",
+    )
+    original_id: Optional[str] = Field(
+        None,
+        description="Upstream Overture building id when source='overture', for traceability.",
+    )
+    edited: bool = Field(
+        False,
+        description="True if the user modified any vertex of the original candidate.",
+    )
+    original_geometry: Optional[Dict] = Field(
+        None,
+        description=(
+            "Optional snapshot of the original Overture polygon (GeoJSON "
+            "Polygon geometry). When present, the UI can restore the "
+            "candidate after a delete instead of treating the deletion as "
+            "final. Only meaningful when source='overture'."
+        ),
+    )
+    notes: Optional[str] = Field(None, max_length=1024)
+    author: Optional[str] = Field(None, max_length=128)
+
+
+def _polygons_to_feature_collection(polygons: List[dict], extra_props: Optional[Dict] = None) -> dict:
+    """Convert the internal (lat, lon) polygon dicts produced by the legacy
+    OSM/MS helpers into a GeoJSON FeatureCollection with (lon, lat) coords."""
+    features = []
+    for p in polygons:
+        coords = p.get("coordinates") or []
+        if len(coords) < 3:
+            continue
+        ring = [[lon, lat] for lat, lon in coords]
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
+        props = {
+            "id": p.get("id"),
+            "type": p.get("type"),
+        }
+        if "area_sqm" in p:
+            props["area_sqm"] = p["area_sqm"]
+        if extra_props:
+            props.update(extra_props)
+        features.append(
+            {
+                "type": "Feature",
+                "id": p.get("id"),
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "properties": props,
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
+
+
+@app.get("/contribute", response_class=HTMLResponse)
+async def contributor_ui():
+    """Serve the OSM contributor web UI."""
+    html_path = Path(__file__).parent / "static" / "contributor_ui.html"
+    return HTMLResponse(content=html_path.read_text())
+
+
+@app.get("/contribute/osm-buildings")
+async def contribute_osm_buildings(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    radius_km: float = Query(0.2, gt=0, le=3.0),
+    all_buildings: bool = Query(
+        True,
+        description="When true, all OSM building tags. When false, residential subtypes only.",
+    ),
+    bypass_cache: bool = Query(
+        False,
+        description="When true, skip the OSM in-memory cache and always hit Overpass.",
+    ),
+):
+    """Return existing OSM buildings as a GeoJSON FeatureCollection.
+
+    Honours an in-memory cache keyed by (lat, lon, radius, all_buildings)
+    with a 5-minute TTL — repeated detection in the same area stays fast
+    and survives short Overpass outages.
+    """
+    radius_meters = radius_km * 1000
+    loop = asyncio.get_event_loop()
+    try:
+        polygons = await loop.run_in_executor(
+            executor,
+            lambda: get_osm_building_polygons(
+                lat, lon, radius_meters,
+                all_buildings=all_buildings,
+                bypass_cache=bypass_cache,
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(502, f"OSM Overpass error: {e}")
+    fc = _polygons_to_feature_collection(polygons, {"layer": "osm"})
+    fc["meta"] = {"polygon_count": len(fc["features"])}
+    return fc
+
+
+@app.get("/contribute/overture-candidates")
+async def contribute_overture_candidates(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    radius_km: float = Query(0.2, gt=0, le=3.0),
+    only_missing: bool = Query(
+        True,
+        description="When true (default) return only Overture polygons not already in OSM. When false return every Overture polygon in the radius.",
+    ),
+    osm_all_buildings: bool = Query(
+        True,
+        description="Used only when only_missing=true: whether to consider all OSM buildings or just residential when deciding 'already in OSM'.",
+    ),
+    bypass_cache: bool = Query(
+        False,
+        description="When true, skip the OSM in-memory cache when deciding 'already in OSM' (Overture itself still uses its disk + memory cache).",
+    ),
+):
+    """Return Overture building polygons (optionally filtered to OSM blind spots)
+    as a GeoJSON FeatureCollection.
+
+    The response always includes a top-level ``meta`` block. When OSM
+    Overpass fails, ``meta.osm_available`` is ``false`` and we still
+    return every Overture polygon in the radius (since the OSM-overlap
+    filter couldn't run) — the UI can warn the user instead of seeing
+    a 500.
+    """
+    radius_meters = radius_km * 1000
+    loop = asyncio.get_event_loop()
+    try:
+        if only_missing:
+            candidates, meta = await loop.run_in_executor(
+                executor,
+                lambda: overture_only_candidates(
+                    lat, lon, radius_meters,
+                    osm_all_buildings=osm_all_buildings,
+                    bypass_cache=bypass_cache,
+                ),
+            )
+            features = [
+                {
+                    "type": "Feature",
+                    "id": c["id"],
+                    "geometry": c["geometry"],
+                    "properties": {
+                        "id": c["id"],
+                        "source": "overture",
+                        "area_sqm": c["area_sqm"],
+                        "vertex_count": c["vertex_count"],
+                        "layer": "overture-candidate",
+                    },
+                }
+                for c in candidates
+            ]
+            return {
+                "type": "FeatureCollection",
+                "features": features,
+                "meta": meta,
+            }
+        else:
+            polygons = await loop.run_in_executor(
+                executor, get_building_polygons_ms, lat, lon, radius_meters
+            )
+            fc = _polygons_to_feature_collection(polygons, {"layer": "overture-all"})
+            fc["meta"] = {"osm_available": True, "osm_error": None, "overture_count": len(fc["features"])}
+            return fc
+    except Exception as e:
+        raise HTTPException(500, f"Overture detection error: {e}")
+
+
+@app.get("/contribute/contributions")
+async def list_contributions():
+    """List every saved contribution, newest first."""
+    items = _contribution_store.list()
+    return {
+        "type": "FeatureCollection",
+        "features": items,
+        "stats": _contribution_store.stats(),
+    }
+
+
+@app.post("/contribute/contributions", status_code=201)
+async def add_contribution(request: ContributionPostRequest):
+    """Validate and persist a contribution. Returns the saved Feature."""
+    try:
+        record = _contribution_store.add(
+            request.feature,
+            notes=request.notes,
+            author=request.author,
+            source=request.source,
+            original_id=request.original_id,
+            edited=request.edited,
+            original_geometry=request.original_geometry,
+        )
+    except ContributionError as e:
+        raise HTTPException(400, str(e))
+    return record
+
+
+class BulkContributionItem(BaseModel):
+    feature: Dict
+    original_id: Optional[str] = None
+    edited: bool = False
+    original_geometry: Optional[Dict] = None
+
+
+class BulkContributionRequest(BaseModel):
+    """POST body for bulk-approving many candidates in one round-trip."""
+
+    items: List[BulkContributionItem] = Field(..., min_length=1, max_length=5000)
+    source: str = Field(
+        "overture",
+        description="Applied to every item. Either 'overture' or 'manual'.",
+    )
+    author: Optional[str] = Field(None, max_length=128)
+    notes: Optional[str] = Field(None, max_length=1024)
+
+
+@app.post("/contribute/contributions/bulk", status_code=201)
+async def add_contributions_bulk(request: BulkContributionRequest):
+    """Validate + persist many contributions in one call.
+
+    Individual failures are reported in ``errors`` and don't block the
+    rest of the batch.
+    """
+    features = [it.feature for it in request.items]
+    original_ids = [it.original_id for it in request.items]
+    edited_flags = [it.edited for it in request.items]
+    original_geometries = [it.original_geometry for it in request.items]
+    result = _contribution_store.add_many(
+        features,
+        source=request.source,
+        author=request.author,
+        notes=request.notes,
+        edited_flags=edited_flags,
+        original_ids=original_ids,
+        original_geometries=original_geometries,
+    )
+    return {
+        "saved_count": len(result["saved"]),
+        "error_count": len(result["errors"]),
+        "saved": result["saved"],
+        "errors": result["errors"],
+    }
+
+
+@app.delete("/contribute/contributions/{contribution_id}")
+async def delete_contribution(contribution_id: str):
+    """Remove a contribution by id."""
+    if _contribution_store.delete(contribution_id):
+        return {"success": True}
+    raise HTTPException(404, "Contribution not found")
+
+
+class BulkDeleteRequest(BaseModel):
+    """POST body for bulk-deleting many contributions in one round-trip."""
+
+    ids: List[str] = Field(..., min_length=1, max_length=5000)
+
+
+@app.post("/contribute/contributions/bulk-delete")
+async def bulk_delete_contributions(request: BulkDeleteRequest):
+    """Delete many contributions by id. Missing ids are returned separately
+    so the caller can distinguish 'gone' from 'never existed'."""
+    result = _contribution_store.delete_many(request.ids)
+    return {
+        "deleted_count": len(result["deleted_ids"]),
+        "missing_count": len(result["missing_ids"]),
+        "deleted_ids": result["deleted_ids"],
+        "missing_ids": result["missing_ids"],
+    }
+
+
+@app.delete("/contribute/contributions")
+async def delete_all_contributions(confirm: bool = Query(False)):
+    """Remove every saved contribution. ``confirm=true`` required to prevent
+    accidents — the route returns 400 otherwise."""
+    if not confirm:
+        raise HTTPException(
+            400,
+            "Refusing to delete all contributions without confirm=true",
+        )
+    removed = _contribution_store.delete_all()
+    return {"deleted_count": removed}
+
+
+@app.get("/contribute/contributions/export.geojson")
+async def export_contributions():
+    """Stream every saved contribution as a single GeoJSON FeatureCollection."""
+    fc = _contribution_store.feature_collection()
+    return JSONResponse(
+        content=fc,
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="osm_contributions.geojson"'
+            )
+        },
+    )
 
 
 if __name__ == "__main__":
