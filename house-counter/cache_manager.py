@@ -7,6 +7,7 @@ for fast repeated queries without S3 round-trips.
 
 import json
 import math
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -21,7 +22,16 @@ import overturemaps
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_CACHE_DIR = Path("building_cache")
+# Anchor to the module file (not CWD) so the cache resolves to the same
+# directory whether the server is started from the repo root, from
+# `house-counter/`, or inside the Docker container (WORKDIR=/app).
+# Override with the BUILDING_CACHE_DIR env var if you want it elsewhere.
+DEFAULT_CACHE_DIR = Path(
+    os.environ.get(
+        "BUILDING_CACHE_DIR",
+        str(Path(__file__).resolve().parent / "building_cache"),
+    )
+)
 AVG_BYTES_PER_BUILDING = 160  # empirical avg after dropping nested columns
 DEFAULT_DENSITY_PER_KM2 = 200  # rough avg; cities include lots of open land
 MAX_CACHE_AREA_KM2 = 10000  # ~100 km × 100 km safety limit
