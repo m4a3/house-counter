@@ -107,18 +107,33 @@ def query_osm_buildings(
 
 
 def get_osm_building_polygons(
-    lat: float, 
-    lon: float, 
-    radius_meters: float
+    lat: float,
+    lon: float,
+    radius_meters: float,
+    all_buildings: bool = False,
 ) -> List[dict]:
     """
     Query OSM for building polygons with geometry.
     Returns list of dicts compatible with the visualization module.
+
+    Args:
+        lat: Latitude of center point
+        lon: Longitude of center point
+        radius_meters: Search radius in meters
+        all_buildings: When True, return every OSM ``building=*`` way (any
+            value). When False (default), restrict to residential building
+            types — matches the behaviour of ``query_osm_buildings`` so the
+            ``/compare`` counts stay apples-to-apples.
     """
+    building_filter = (
+        '["building"]'
+        if all_buildings
+        else '["building"~"^(house|residential|detached|semidetached_house|terrace|apartments|bungalow)$"]'
+    )
     query = f"""
     [out:json][timeout:120];
     (
-      way["building"~"^(house|residential|detached|semidetached_house|terrace|apartments|bungalow)$"](around:{radius_meters},{lat},{lon});
+      way{building_filter}(around:{radius_meters},{lat},{lon});
     );
     out body geom;
     """
