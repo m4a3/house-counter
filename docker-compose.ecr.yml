@@ -12,6 +12,7 @@ services:
       - "8008"
     volumes:
       - building_cache:/app/building_cache
+      - contributions:/app/contributions
     env_file:
       - .env
     restart: unless-stopped
@@ -37,4 +38,5 @@ services:
 
 volumes:
   building_cache:
+  contributions:
   garden_output:
