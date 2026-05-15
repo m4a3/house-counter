@@ -827,7 +827,10 @@ class BulkContributionItem(BaseModel):
 class BulkContributionRequest(BaseModel):
     """POST body for bulk-approving many candidates in one round-trip."""
 
-    items: List[BulkContributionItem] = Field(..., min_length=1, max_length=5000)
+    # 50k is enough for a dense 3 km radius (~10k buildings observed in
+    # Tulsa; cities like Cairo or Mumbai push much higher). Still finite
+    # so a runaway client can't DoS the validator.
+    items: List[BulkContributionItem] = Field(..., min_length=1, max_length=50000)
     source: str = Field(
         "overture",
         description="Applied to every item. Either 'overture' or 'manual'.",
@@ -875,7 +878,7 @@ async def delete_contribution(contribution_id: str):
 class BulkDeleteRequest(BaseModel):
     """POST body for bulk-deleting many contributions in one round-trip."""
 
-    ids: List[str] = Field(..., min_length=1, max_length=5000)
+    ids: List[str] = Field(..., min_length=1, max_length=50000)
 
 
 @app.post("/contribute/contributions/bulk-delete")

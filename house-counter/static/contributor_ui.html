@@ -527,6 +527,24 @@
       await bulkApprove(items, layersToRemove);
     }
 
+    function formatApiError(err, status) {
+      // FastAPI returns 422 detail as a structured list of validation
+      // errors. Flatten it to a one-line message so we don't end up
+      // toast()-ing or console.log()-ing "[object Object]".
+      const detail = err && err.detail;
+      if (!detail) return `HTTP ${status}`;
+      if (typeof detail === "string") return detail;
+      if (Array.isArray(detail)) {
+        return detail
+          .map(d => {
+            const loc = Array.isArray(d.loc) ? d.loc.join(".") : "?";
+            return `${loc}: ${d.msg || d.type || "invalid"}`;
+          })
+          .join("; ");
+      }
+      try { return JSON.stringify(detail); } catch { return `HTTP ${status}`; }
+    }
+
     async function bulkApprove(items, layersToRemove) {
       if (!items.length) return;
       document.getElementById("approve-all-btn").disabled = true;
@@ -543,7 +561,8 @@
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `HTTP ${res.status}`);
+          console.error("Bulk approve rejected:", res.status, err);
+          throw new Error(formatApiError(err, res.status));
         }
         const result = await res.json();
         layersToRemove.forEach(l => {
@@ -790,7 +809,8 @@
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `HTTP ${res.status}`);
+          console.error("Approve rejected:", res.status, err);
+          throw new Error(formatApiError(err, res.status));
         }
         const saved = await res.json();
         // Move from candidates layer to approved layer
@@ -844,7 +864,8 @@
             });
             if (!res.ok) {
               const err = await res.json().catch(() => ({}));
-              throw new Error(err.detail || `HTTP ${res.status}`);
+              console.error("Save rejected:", res.status, err);
+              throw new Error(formatApiError(err, res.status));
             }
             const saved = await res.json();
             drawnItems.removeLayer(layer);
@@ -971,7 +992,8 @@
         );
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `HTTP ${res.status}`);
+          console.error("Delete-all rejected:", res.status, err);
+          throw new Error(formatApiError(err, res.status));
         }
         const result = await res.json();
         restorable.forEach(restoreCandidateFromContribution);
@@ -998,7 +1020,8 @@
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `HTTP ${res.status}`);
+          console.error("Bulk delete rejected:", res.status, err);
+          throw new Error(formatApiError(err, res.status));
         }
         const result = await res.json();
         restorable.forEach(restoreCandidateFromContribution);
