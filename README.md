@@ -6,7 +6,7 @@ Two Python/FastAPI services deployed together behind an nginx reverse proxy.
 
 | Service | Path Prefix | Port | Description |
 |---|---|---|---|
-| [house-counter](house-counter/README.md) | `/buildings/` | 8008 | Count buildings within a radius using Microsoft Building Footprints |
+| [house-counter](house-counter/README.md) | `/buildings/` | 8008 | Count buildings within a radius using Microsoft Building Footprints, plus an OSM contributor UI at `/buildings/contribute` |
 | [front-back-garden](front-back-garden/README.md) | `/garden/` | 8000 | Classify front/back gardens and place delivery pins using aerial imagery |
 
 ## Quick Start
@@ -20,6 +20,7 @@ docker compose up --build
 ```
 
 - House Counter API: `http://localhost/buildings/count?lat=53.38&lon=-6.38&radius_km=1`
+- House Counter contributor UI: `http://localhost/buildings/contribute`
 - Garden Classifier API: `http://localhost/garden/docs`
 
 ## Environment Variables
